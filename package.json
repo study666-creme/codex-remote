@@ -14,7 +14,7 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "npm run dev -w @codex-remote/web",
+    "dev": "vite apps/web",
     "build": "npm run build -w @codex-remote/shared && npm run build -w @codex-remote/bridge && npm run build -w @codex-remote/web",
     "typecheck": "npm run build -w @codex-remote/shared && npm run typecheck -w @codex-remote/bridge && npm run typecheck -w @codex-remote/web",
     "bridge": "npm run dev -w @codex-remote/bridge",
