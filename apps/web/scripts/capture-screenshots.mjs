@@ -49,6 +49,8 @@ const messages = [
   { id: "m4", role: "user", text: "构建通过后，再检查暗色模式和输入框安全区。" },
   { id: "m5", role: "assistant", title: "Codex", text: "构建和类型检查均已通过，暗色模式与底部安全区也已完成回归验证。" },
 ];
+const pendingPrompt = "继续检查移动端布局";
+const thinkingMessages = [...messages, { id: "m6", role: "user", text: pendingPrompt }];
 
 const repos = [
   {
@@ -77,7 +79,7 @@ try {
     browser = await chromium.launch({ channel: "msedge", headless: true });
   }
 
-  async function createPage({ queue = [], guides = [] } = {}) {
+  async function createPage({ queue = [], guides = [], busy = false } = {}) {
     const page = await browser.newPage({
       viewport: { width: 390, height: 844 },
       deviceScaleFactor: 1,
@@ -87,7 +89,7 @@ try {
       locale: "zh-CN",
     });
 
-    await page.addInitScript(({ initialSettings, initialProjects, initialMessages, initialQueue, initialGuides }) => {
+    await page.addInitScript(({ initialSettings, initialProjects, initialMessages, initialQueue, initialGuides, initialBusy, initialPendingPrompt }) => {
       localStorage.setItem("infinite-canvas:theme_store", JSON.stringify({ state: { theme: "dark" } }));
       localStorage.setItem("codex-remote-mobile:settings", JSON.stringify(initialSettings));
       localStorage.setItem("codex-remote-mobile:projects", JSON.stringify(initialProjects));
@@ -96,7 +98,8 @@ try {
       localStorage.setItem("codex-remote-mobile:messages:storefront", JSON.stringify(initialMessages));
       localStorage.setItem("codex-remote-mobile:task-queue", JSON.stringify(initialQueue));
       if (initialGuides.length) localStorage.setItem("codex-remote-mobile:pending-guide", JSON.stringify(initialGuides));
-    }, { initialSettings: settings, initialProjects: projects, initialMessages: messages, initialQueue: queue, initialGuides: guides });
+      if (initialBusy) localStorage.setItem("codex-remote-mobile:pending-run", JSON.stringify({ threadId: "thread-a", canvasId: "storefront", prompt: initialPendingPrompt, startedAt: Date.now() }));
+    }, { initialSettings: settings, initialProjects: projects, initialMessages: messages, initialQueue: queue, initialGuides: guides, initialBusy: busy, initialPendingPrompt: pendingPrompt });
 
     await page.route("https://agent.example.com/**", async (route) => {
       const request = route.request();
@@ -106,9 +109,9 @@ try {
       if (url.pathname === "/agent/codex/workspace") return route.fulfill({ status: 200, headers, json: { ok: true, workspace } });
       if (url.pathname === "/agent/codex/workspaces") return route.fulfill({ status: 200, headers, json: { ok: true, projects, data: threads } });
       if (url.pathname === "/agent/codex/threads") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, data: threads.filter((item) => item.cwd === workspace.workspacePath) } });
-      if (url.pathname === "/agent/codex/status") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, busy: false, canSteer: false, thread: threads[0] } });
+      if (url.pathname === "/agent/codex/status") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, busy, canSteer: busy, activeTurnId: busy ? "turn-a" : "", thread: threads[0] } });
       if (url.pathname === "/agent/git/repos") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, repos } });
-      if (url.pathname.startsWith("/agent/codex/threads/")) return route.fulfill({ status: 200, headers, json: { ok: true, workspace, messages } });
+      if (url.pathname.startsWith("/agent/codex/threads/")) return route.fulfill({ status: 200, headers, json: { ok: true, workspace, messages: busy ? thinkingMessages : messages } });
       return route.fulfill({ status: 200, headers, json: { ok: true } });
     });
 
@@ -137,9 +140,16 @@ try {
     guides: [{ id: "g1", text: "先修复按钮重叠，暂时不要调整页面配色。", attachments: [], createdAt: Date.now() }],
   });
   const chatShot = await fs.readFile(path.join(outputDir, "02-mobile-chat.png"));
-  await page.locator('input[type="file"]').setInputFiles({ name: "mobile-reference.png", mimeType: "image/png", buffer: chatShot });
-  await page.locator("textarea").fill("按截图继续检查 390px 页面");
+  const fileInputs = page.locator('input[type="file"]');
+  await fileInputs.nth(0).setInputFiles({ name: "mobile-reference.png", mimeType: "image/png", buffer: chatShot });
+  await fileInputs.nth(1).setInputFiles({ name: "acceptance-checklist.md", mimeType: "text/markdown", buffer: Buffer.from("# 验收清单\n\n- 检查 390px 布局\n- 检查暗色模式\n") });
+  await page.locator("textarea").fill("结合截图和验收文档继续检查 390px 页面");
   await capture(page, "04-attachments-queue.png");
+
+  page = await createPage({ busy: true });
+  await page.locator(".mobile-agent-thinking-sweep-text").waitFor();
+  await page.waitForTimeout(650);
+  await capture(page, "09-thinking-effect.png");
 
   page = await createPage();
   await page.getByRole("button", { name: "需求索引" }).click();
@@ -149,6 +159,24 @@ try {
   page = await createPage();
   await page.getByRole("button", { name: "打开侧边栏" }).click();
   await page.getByRole("heading", { name: "项目与会话" }).waitFor();
+  const conversationNavigationRequests = [];
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === "/agent/codex/threads/new" || pathname.endsWith("/resume")) conversationNavigationRequests.push(pathname);
+  });
+  const apiProjectButton = page.locator('button[aria-expanded]').filter({ hasText: "api-service" });
+  await apiProjectButton.click();
+  await page.waitForTimeout(250);
+  const projectClickState = await page.evaluate(() => ({
+    activeProjectId: localStorage.getItem("codex-remote-mobile:active-project"),
+    settings: JSON.parse(localStorage.getItem("codex-remote-mobile:settings") || "{}"),
+  }));
+  if ((await apiProjectButton.getAttribute("aria-expanded")) !== "true") throw new Error("Project card did not expand");
+  if (!(await page.getByRole("heading", { name: "项目与会话" }).isVisible())) throw new Error("Project card click closed the drawer");
+  if (projectClickState.activeProjectId !== "storefront" || projectClickState.settings.threadId !== "thread-a") throw new Error("Project card click switched the active conversation");
+  if (conversationNavigationRequests.length) throw new Error(`Project card click requested conversation navigation: ${conversationNavigationRequests.join(", ")}`);
+  await apiProjectButton.click();
+  await page.locator('button[aria-expanded]').filter({ hasText: "storefront" }).click();
   await page.getByText("商品列表性能", { exact: true }).waitFor();
   await capture(page, "03-workspaces-threads.png");
 

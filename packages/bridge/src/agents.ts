@@ -12,6 +12,8 @@ type AgentEvent = Json & { type: string; usage?: unknown };
 type PendingRequest = { resolve: (value: unknown) => void; reject: (error: Error) => void };
 type CodexModelOptions = { model?: string; effort?: string };
 type CodexRunOptions = { threadId?: string; cwd?: string } & CodexModelOptions;
+type DocumentMention = { name: string; path: string };
+type PreparedAttachments = { images: string[]; documents: DocumentMention[]; cleanupPaths: string[] };
 type AgentHistoryMessage = {
   id: string;
   role: "user" | "assistant" | "tool" | "error";
@@ -44,18 +46,23 @@ export async function steerCodexTurn(
   options: Required<Pick<CodexRunOptions, "threadId">> & Pick<CodexRunOptions, "cwd">,
 ) {
   if (!prompt.trim()) throw new Error("Steering prompt cannot be empty.");
-  let files: string[] = [];
+  let prepared = emptyPreparedAttachments();
+  let cleanupDeferred = false;
   try {
-    files = await writeAttachmentFiles(attachments);
+    prepared = await prepareAttachmentFiles(attachments);
     codexApp ||= await CodexAppClient.start(emit);
     let activeTurnId = codexApp.activeTurnId(options.threadId);
     if (!activeTurnId) {
       const thread = await loadCodexThread(emit, options.threadId, options.cwd, true);
       activeTurnId = activeTurnIdFromThread(thread);
     }
-    await codexApp.steerTurn(options.threadId, prompt, files, activeTurnId);
+    await codexApp.steerTurn(options.threadId, prompt, prepared.images, prepared.documents, activeTurnId);
+    if (prepared.documents.length) {
+      deferAttachmentCleanup(prepared);
+      cleanupDeferred = true;
+    }
   } finally {
-    await Promise.all(files.map((file) => fs.unlink(file).catch(() => undefined)));
+    if (!cleanupDeferred) await cleanupPreparedAttachments(prepared);
   }
 }
 
@@ -71,16 +78,21 @@ export async function getCodexThreadStatus(emit: AgentEmit, threadId: string, cw
 }
 
 async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: AgentAttachment[], options: CodexRunOptions) {
-  let files: string[] = [];
+  let prepared = emptyPreparedAttachments();
+  let cleanupDeferred = false;
   try {
-    files = await writeAttachmentFiles(attachments);
+    prepared = await prepareAttachmentFiles(attachments);
     codexApp ||= await CodexAppClient.start(emit);
     const threadId = await ensureCodexThread(codexApp, options);
-    await codexApp.startTurn(threadId, prompt, files, options);
+    await codexApp.startTurn(threadId, prompt, prepared.images, prepared.documents, options);
+    if (prepared.documents.length) {
+      deferAttachmentCleanup(prepared);
+      cleanupDeferred = true;
+    }
   } catch (error) {
     emit("agent_error", { message: errorMessage(error) });
   } finally {
-    await Promise.all(files.map((file) => fs.unlink(file).catch(() => undefined)));
+    if (!cleanupDeferred) await cleanupPreparedAttachments(prepared);
   }
 }
 
@@ -237,10 +249,10 @@ class CodexAppClient {
     return this.request("thread/archive", { threadId });
   }
 
-  async startTurn(threadId: string, prompt: string, images: string[], options: CodexModelOptions = {}) {
+  async startTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], options: CodexModelOptions = {}) {
     const result = await this.request("turn/start", {
       threadId,
-      input: codexInput(prompt, images),
+      input: codexInput(prompt, images, documents),
       approvalPolicy: "never",
       ...codexTurnRequestOptions(options),
     });
@@ -260,10 +272,10 @@ class CodexAppClient {
     }
   }
 
-  steerTurn(threadId: string, prompt: string, images: string[], activeTurnId = "") {
+  steerTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], activeTurnId = "") {
     const expectedTurnId = activeTurnId || this.activeTurnByThread.get(threadId);
     if (!expectedTurnId) throw new Error("This thread has no active Codex turn to steer.");
-    return this.request("turn/steer", { threadId, input: codexInput(prompt, images), expectedTurnId });
+    return this.request("turn/steer", { threadId, input: codexInput(prompt, images, documents), expectedTurnId });
   }
 
   activeTurnId(threadId?: string) {
@@ -408,8 +420,12 @@ function codexTurnRequestOptions(options: CodexModelOptions = {}) {
   };
 }
 
-function codexInput(prompt: string, images: string[]) {
-  return [{ type: "text", text: prompt, text_elements: [] }, ...images.map((file) => ({ type: "localImage", path: file }))];
+function codexInput(prompt: string, images: string[], documents: DocumentMention[]) {
+  return [
+    { type: "text", text: prompt, text_elements: [] },
+    ...images.map((file) => ({ type: "localImage", path: file })),
+    ...documents.map((file) => ({ type: "mention", name: file.name, path: file.path })),
+  ];
 }
 
 function normalizeCodexNotification(method: string, params: Json): AgentEvent | null {
@@ -564,16 +580,86 @@ function stringOrNull(value: unknown) {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
-async function writeAttachmentFiles(attachments: AgentAttachment[]) {
-  return Promise.all(attachments.filter((item) => item.dataUrl?.startsWith("data:image/")).map(writeAttachmentFile));
+const maxAttachmentCount = 6;
+const maxAttachmentBytes = 8 * 1024 * 1024;
+const maxAttachmentTotalBytes = 18 * 1024 * 1024;
+const documentExtensions = new Set([
+  ".c", ".cfg", ".cpp", ".cs", ".csv", ".doc", ".docx", ".go", ".h", ".hpp", ".htm", ".html", ".ini", ".java", ".js", ".json", ".jsonl", ".jsx", ".log", ".md", ".markdown", ".pdf", ".php", ".ppt", ".pptx", ".ps1", ".py", ".rb", ".rs", ".rtf", ".sh", ".sql", ".toml", ".ts", ".tsv", ".tsx", ".txt", ".xls", ".xlsx", ".xml", ".yaml", ".yml",
+]);
+
+export async function prepareAttachmentFiles(attachments: AgentAttachment[]): Promise<PreparedAttachments> {
+  if (attachments.length > maxAttachmentCount) throw new Error(`At most ${maxAttachmentCount} attachments can be sent at once.`);
+  const prepared = emptyPreparedAttachments();
+  let totalBytes = 0;
+  let documentDir = "";
+  try {
+    for (const [index, item] of attachments.entries()) {
+      const { mime, bytes } = decodeAttachment(item);
+      if (bytes.length > maxAttachmentBytes) throw new Error(`${item.name || "Attachment"} exceeds the 8 MB limit.`);
+      totalBytes += bytes.length;
+      if (totalBytes > maxAttachmentTotalBytes) throw new Error("Attachments exceed the 18 MB combined limit.");
+      if (mime.startsWith("image/") && item.kind !== "document") {
+        const file = path.join(os.tmpdir(), `codex-remote-${Date.now()}-${Math.random().toString(16).slice(2)}.${imageExt(mime || item.type)}`);
+        await fs.writeFile(file, bytes);
+        prepared.images.push(file);
+        prepared.cleanupPaths.push(file);
+        continue;
+      }
+
+      const extension = documentExtension(item.name, mime || item.type);
+      if (!extension) throw new Error(`${item.name || "Document"} is not a supported document type.`);
+      if (!documentDir) {
+        documentDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-remote-docs-"));
+        prepared.cleanupPaths.push(documentDir);
+      }
+      const name = safeAttachmentName(item.name, extension, index);
+      const file = path.join(documentDir, name);
+      await fs.writeFile(file, bytes);
+      prepared.documents.push({ name: item.name?.trim() || name, path: file });
+    }
+    return prepared;
+  } catch (error) {
+    await cleanupPreparedAttachments(prepared);
+    throw error;
+  }
 }
 
-async function writeAttachmentFile(item: AgentAttachment) {
-  const [, meta = "", data = ""] = item.dataUrl?.match(/^data:([^;]+);base64,(.+)$/) || [];
-  if (!data) throw new Error(`Invalid image attachment: ${item.name || "unnamed image"}`);
-  const file = path.join(os.tmpdir(), `codex-remote-${Date.now()}-${Math.random().toString(16).slice(2)}.${imageExt(meta || item.type)}`);
-  await fs.writeFile(file, Buffer.from(data, "base64"));
-  return file;
+function decodeAttachment(item: AgentAttachment) {
+  const [, mime = "", data = ""] = item.dataUrl?.match(/^data:([^;,]*);base64,(.+)$/) || [];
+  if (!data) throw new Error(`Invalid attachment: ${item.name || "unnamed file"}`);
+  return { mime: mime.toLowerCase(), bytes: Buffer.from(data, "base64") };
+}
+
+function documentExtension(name = "", type = "") {
+  const extension = path.extname(path.basename(name)).toLowerCase();
+  if (documentExtensions.has(extension)) return extension;
+  const mime = type.toLowerCase();
+  if (mime === "application/pdf") return ".pdf";
+  if (mime.startsWith("text/")) return ".txt";
+  if (mime.includes("wordprocessingml")) return ".docx";
+  if (mime.includes("spreadsheetml")) return ".xlsx";
+  if (mime.includes("presentationml")) return ".pptx";
+  return "";
+}
+
+function safeAttachmentName(name: string | undefined, extension: string, index: number) {
+  const basename = path.basename(name || `document${extension}`);
+  const stem = basename.slice(0, Math.max(0, basename.length - path.extname(basename).length));
+  const safeStem = stem.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "").slice(0, 80) || "document";
+  return `${index + 1}-${safeStem}${extension}`;
+}
+
+function emptyPreparedAttachments(): PreparedAttachments {
+  return { images: [], documents: [], cleanupPaths: [] };
+}
+
+export async function cleanupPreparedAttachments(prepared: PreparedAttachments) {
+  await Promise.all(prepared.cleanupPaths.map((file) => fs.rm(file, { recursive: true, force: true }).catch(() => undefined)));
+}
+
+function deferAttachmentCleanup(prepared: PreparedAttachments) {
+  const timer = setTimeout(() => void cleanupPreparedAttachments(prepared), 60 * 60 * 1000);
+  timer.unref();
 }
 
 function imageExt(type = "") {

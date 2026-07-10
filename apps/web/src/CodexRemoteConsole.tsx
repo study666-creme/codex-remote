@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, ChevronDown, Clock3, Copy, FolderGit2, GitBranch, ImagePlus, ListTodo, LoaderCircle, Menu, Pencil, PlugZap, Plus, RefreshCcw, RotateCcw, SendHorizontal, Settings2, TerminalSquare, Trash2, UploadCloud, X } from "lucide-react";
+import { CheckCircle2, ChevronDown, Clock3, Copy, FileText, FileUp, FolderGit2, GitBranch, ImagePlus, ListTodo, LoaderCircle, Menu, Pencil, PlugZap, Plus, RefreshCcw, RotateCcw, SendHorizontal, Settings2, TerminalSquare, Trash2, UploadCloud, X } from "lucide-react";
 
 type MessageRole = "user" | "assistant" | "tool" | "error" | "status";
 type MobileMessage = { id: string; role: MessageRole; title?: string; text: string; streamId?: string };
@@ -32,7 +32,7 @@ type ThreadSummary = {
     updatedAt?: number;
     createdAt?: number;
 };
-type AgentAttachment = { name?: string; type?: string; dataUrl?: string };
+type AgentAttachment = { name?: string; type?: string; dataUrl?: string; kind?: "image" | "document"; size?: number };
 type QueuedTaskStatus = "queued" | "running" | "done" | "failed";
 type QueuedTask = { id: string; text: string; attachments: AgentAttachment[]; createdAt: number; status: QueuedTaskStatus; error?: string };
 type PendingGuide = { id: string; text: string; attachments: AgentAttachment[]; createdAt: number };
@@ -54,6 +54,10 @@ const codexRemoteDemoMode = false;
 const codexRemoteDailyTurnLimit = 10;
 const defaultAgentUrl = String(import.meta.env.VITE_CODEX_REMOTE_DEFAULT_AGENT_URL || "").trim();
 const pendingRunMaxAge = 1000 * 60 * 60 * 12;
+const maxAttachmentCount = 6;
+const maxAttachmentBytes = 8 * 1024 * 1024;
+const documentAccept = ".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.md,.markdown,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.html,.htm,.rtf,.log,.js,.jsx,.ts,.tsx,.py,.java,.c,.h,.cpp,.hpp,.cs,.go,.rs,.rb,.php,.sh,.ps1,.sql,.toml,.ini,.cfg";
+const documentExtensions = new Set(documentAccept.split(","));
 const projectPresets: ProjectPreset[] = [];
 const defaultSettings: Settings = {
     agentUrl: defaultAgentUrl,
@@ -430,13 +434,32 @@ function isNearBottom(element: HTMLElement, distance = 80) {
     return element.scrollHeight - element.scrollTop - element.clientHeight < distance;
 }
 
-function readFileAsDataUrl(file: File) {
+function readFileAsDataUrl(file: File, kind: "image" | "document") {
     return new Promise<AgentAttachment>((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = () => resolve({ name: file.name, type: file.type, dataUrl: String(reader.result || "") });
-        reader.onerror = () => reject(reader.error || new Error("读取图片失败"));
+        reader.onload = () => resolve({ name: file.name, type: file.type, dataUrl: String(reader.result || ""), kind, size: file.size });
+        reader.onerror = () => reject(reader.error || new Error("读取附件失败"));
         reader.readAsDataURL(file);
     });
+}
+
+function isImageAttachment(item: AgentAttachment) {
+    return item.kind === "image" || (!item.kind && item.type?.startsWith("image/"));
+}
+
+function isSupportedDocument(file: File) {
+    const extension = `.${file.name.split(".").pop()?.toLowerCase() || ""}`;
+    return documentExtensions.has(extension) || file.type === "application/pdf" || file.type.startsWith("text/");
+}
+
+function attachmentSummary(items: AgentAttachment[]) {
+    const images = items.filter(isImageAttachment).length;
+    const documents = items.length - images;
+    return [images ? `${images} 张图片` : "", documents ? `${documents} 个文档` : ""].filter(Boolean).join(" · ");
+}
+
+function attachmentExtension(item: AgentAttachment) {
+    return item.name?.split(".").pop()?.slice(0, 5).toUpperCase() || "FILE";
 }
 
 export function CodexRemoteConsole() {
@@ -454,6 +477,7 @@ export function CodexRemoteConsole() {
     const [projects, setProjects] = useState<ProjectPreset[]>(projectPresets);
     const [projectsLoading, setProjectsLoading] = useState(false);
     const [activeProjectId, setActiveProjectId] = useState("");
+    const [expandedProjectId, setExpandedProjectId] = useState("");
     const [projectFormOpen, setProjectFormOpen] = useState(false);
     const [editingProjectId, setEditingProjectId] = useState("");
     const [projectDraft, setProjectDraft] = useState<ProjectDraft>(emptyProjectDraft);
@@ -504,6 +528,7 @@ export function CodexRemoteConsole() {
     const messageElementsRef = useRef(new Map<string, HTMLElement>());
     const inputRef = useRef<HTMLTextAreaElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const documentInputRef = useRef<HTMLInputElement>(null);
     const atBottomRef = useRef(true);
 
     const canSend = useMemo(() => Boolean(input.trim() || attachments.length), [attachments.length, input]);
@@ -610,6 +635,11 @@ export function CodexRemoteConsole() {
     useEffect(() => {
         if (hydrated) localStorage.setItem(projectsKey, JSON.stringify(projects));
     }, [hydrated, projects]);
+
+    useEffect(() => {
+        if (!threadsOpen) return;
+        setExpandedProjectId((value) => value || activeProject?.id || projects[0]?.id || "");
+    }, [activeProject?.id, projects, threadsOpen]);
 
     useEffect(() => {
         if (!hydrated) return;
@@ -783,7 +813,7 @@ export function CodexRemoteConsole() {
         if (!trimmed && !taskAttachments.length) return null;
         const draft: PendingGuide = {
             id: createId(),
-            text: trimmed || "请根据图片继续处理当前任务。",
+            text: trimmed || "请根据所附图片或文档继续处理当前任务。",
             attachments: taskAttachments,
             createdAt: Date.now(),
         };
@@ -809,7 +839,7 @@ export function CodexRemoteConsole() {
         if (currentInput || currentAttachments.length) {
             nextGuides.push({
                 id: createId(),
-                text: currentInput || "请根据图片继续处理当前任务。",
+                text: currentInput || "请根据所附图片或文档继续处理当前任务。",
                 attachments: currentAttachments,
                 createdAt: Date.now(),
             });
@@ -1551,7 +1581,7 @@ export function CodexRemoteConsole() {
         setProjectFormOpen(false);
         setEditingProjectId("");
         setProjectDraft(emptyProjectDraft);
-        if (!editingProjectId || activeProjectId === editingProjectId) void selectProject(nextProject);
+        setExpandedProjectId(nextProject.id);
     }
 
     function deleteProject(project: ProjectPreset) {
@@ -1562,10 +1592,9 @@ export function CodexRemoteConsole() {
         const nextProjects = projects.filter((item) => item.id !== project.id);
         setProjects(nextProjects);
         if (activeProjectId === project.id) {
-            const nextProject = nextProjects[0];
-            setActiveProjectId(nextProject?.id || "");
-            if (nextProject) void selectProject(nextProject);
+            setActiveProjectId("");
         }
+        setExpandedProjectId((value) => (value === project.id ? nextProjects[0]?.id || "" : value));
     }
 
     const selectThread = async (thread: ThreadSummary) => {
@@ -1689,7 +1718,7 @@ export function CodexRemoteConsole() {
         setSending(true);
         pendingPromptRef.current = prompt;
         setTemporaryStatus("Codex 正在接收任务...");
-        pushMessage({ id: createId(), role: "user", text: currentAttachments.length ? `${prompt}\n\n[图片附件 ${currentAttachments.length} 张]` : prompt });
+        pushMessage({ id: createId(), role: "user", text: currentAttachments.length ? `${prompt}\n\n[附件：${attachmentSummary(currentAttachments)}]` : prompt });
         upsertStreamMessage({ id: "turn-status", role: "status", text: "Codex 正在处理..." });
         try {
             const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
@@ -1756,7 +1785,7 @@ export function CodexRemoteConsole() {
     const submit = async (event?: FormEvent<HTMLFormElement>) => {
         event?.preventDefault();
         const currentAttachments = attachments;
-        const prompt = input.trim() || (currentAttachments.length ? "请根据图片继续处理当前任务。" : "");
+        const prompt = input.trim() || (currentAttachments.length ? "请根据所附图片或文档继续处理当前任务。" : "");
         if (!prompt) return;
         setInput("");
         setAttachments([]);
@@ -1774,14 +1803,43 @@ export function CodexRemoteConsole() {
     };
 
     const pickImages = async (event: ChangeEvent<HTMLInputElement>) => {
-        const files = [...(event.target.files || [])].filter((file) => file.type.startsWith("image/")).slice(0, 6);
+        const selected = [...(event.target.files || [])];
         event.target.value = "";
+        const oversized = selected.find((file) => file.size > maxAttachmentBytes);
+        if (oversized) {
+            pushMessage({ id: createId(), role: "error", title: "图片过大", text: `${oversized.name} 超过 8 MB。` });
+            return;
+        }
+        const files = selected.filter((file) => file.type.startsWith("image/")).slice(0, maxAttachmentCount);
         if (!files.length) return;
         try {
-            const next = await Promise.all(files.map(readFileAsDataUrl));
-            setAttachments((items) => [...items, ...next].slice(0, 6));
+            const next = await Promise.all(files.map((file) => readFileAsDataUrl(file, "image")));
+            setAttachments((items) => [...items, ...next].slice(0, maxAttachmentCount));
         } catch (error) {
             pushMessage({ id: createId(), role: "error", title: "图片读取失败", text: error instanceof Error ? error.message : String(error) });
+        }
+    };
+
+    const pickDocuments = async (event: ChangeEvent<HTMLInputElement>) => {
+        const selected = [...(event.target.files || [])];
+        event.target.value = "";
+        const unsupported = selected.find((file) => !isSupportedDocument(file));
+        if (unsupported) {
+            pushMessage({ id: createId(), role: "error", title: "文档格式不支持", text: unsupported.name });
+            return;
+        }
+        const oversized = selected.find((file) => file.size > maxAttachmentBytes);
+        if (oversized) {
+            pushMessage({ id: createId(), role: "error", title: "文档过大", text: `${oversized.name} 超过 8 MB。` });
+            return;
+        }
+        const files = selected.slice(0, maxAttachmentCount);
+        if (!files.length) return;
+        try {
+            const next = await Promise.all(files.map((file) => readFileAsDataUrl(file, "document")));
+            setAttachments((items) => [...items, ...next].slice(0, maxAttachmentCount));
+        } catch (error) {
+            pushMessage({ id: createId(), role: "error", title: "文档读取失败", text: error instanceof Error ? error.message : String(error) });
         }
     };
 
@@ -1955,7 +2013,7 @@ export function CodexRemoteConsole() {
                                                         </button>
                                                     </div>
                                                 </div>
-                                                {pendingGuide.attachments.length ? <div className="mt-1 text-xs text-stone-500 dark:text-stone-300">{pendingGuide.attachments.length} 张图片</div> : null}
+                                                {pendingGuide.attachments.length ? <div className="mt-1 text-xs text-stone-500 dark:text-stone-300">{attachmentSummary(pendingGuide.attachments)}</div> : null}
                                             </div>
                                             <button
                                                 type="button"
@@ -1992,7 +2050,7 @@ export function CodexRemoteConsole() {
                                                 >
                                                     {task.status === "running" ? "执行中" : task.status === "failed" ? "失败" : "待执行"}
                                                 </span>
-                                                {task.attachments.length ? <span>{task.attachments.length} 张图</span> : null}
+                                                {task.attachments.length ? <span>{attachmentSummary(task.attachments)}</span> : null}
                                             </div>
                                             <div className="mt-1 line-clamp-2 break-words text-sm leading-5 text-stone-900 dark:text-stone-100">{task.text}</div>
                                             {task.error ? <div className="mt-1 text-xs leading-5 text-red-700 dark:text-red-200">{task.error}</div> : null}
@@ -2017,8 +2075,15 @@ export function CodexRemoteConsole() {
                     <div className="mx-auto mb-2 flex max-w-3xl gap-2 overflow-x-auto">
                         {attachments.map((item, index) => (
                             <div key={`${item.name}-${index}`} className="relative size-16 shrink-0 overflow-hidden rounded-xl border border-black/10 bg-white dark:border-white/10 dark:bg-white/[0.06]">
-                                {item.dataUrl ? <img src={item.dataUrl} alt={item.name || "attachment"} className="size-full object-cover" /> : null}
-                                <button type="button" className="absolute right-1 top-1 grid size-5 place-items-center rounded-full bg-black/70 text-white" onClick={() => setAttachments((items) => items.filter((_, itemIndex) => itemIndex !== index))} aria-label="移除图片">
+                                {item.dataUrl && isImageAttachment(item) ? (
+                                    <img src={item.dataUrl} alt={item.name || "attachment"} className="size-full object-cover" />
+                                ) : (
+                                    <div className="flex size-full flex-col items-center justify-center gap-1 px-1 text-stone-500 dark:text-stone-300" title={item.name}>
+                                        <FileText className="size-5" />
+                                        <span className="w-full truncate text-center text-[10px] font-semibold">{attachmentExtension(item)}</span>
+                                    </div>
+                                )}
+                                <button type="button" className="absolute right-1 top-1 grid size-5 place-items-center rounded-full bg-black/70 text-white" onClick={() => setAttachments((items) => items.filter((_, itemIndex) => itemIndex !== index))} aria-label="移除附件">
                                     <X className="size-3" />
                                 </button>
                             </div>
@@ -2027,8 +2092,12 @@ export function CodexRemoteConsole() {
                 ) : null}
                 <div className="mx-auto flex max-w-3xl items-end gap-2 rounded-3xl border border-black/10 bg-[#f9f8f4] p-2 shadow-[0_12px_34px_rgba(23,21,19,.10)] dark:border-white/10 dark:bg-white/[0.06]">
                     <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(event) => void pickImages(event)} />
-                    <button type="button" className="grid size-10 shrink-0 place-items-center rounded-2xl text-stone-500 transition hover:bg-black/[0.04] hover:text-stone-950 dark:text-stone-300 dark:hover:bg-sky-400/10 dark:hover:text-sky-100" onClick={() => fileInputRef.current?.click()} aria-label="添加图片">
+                    <input ref={documentInputRef} type="file" accept={documentAccept} multiple className="hidden" onChange={(event) => void pickDocuments(event)} />
+                    <button type="button" className="grid size-10 shrink-0 place-items-center rounded-2xl text-stone-500 transition hover:bg-black/[0.04] hover:text-stone-950 dark:text-stone-300 dark:hover:bg-sky-400/10 dark:hover:text-sky-100" onClick={() => fileInputRef.current?.click()} aria-label="添加图片" title="添加图片">
                         <ImagePlus className="size-4" />
+                    </button>
+                    <button type="button" className="grid size-10 shrink-0 place-items-center rounded-2xl text-stone-500 transition hover:bg-black/[0.04] hover:text-stone-950 dark:text-stone-300 dark:hover:bg-sky-400/10 dark:hover:text-sky-100" onClick={() => documentInputRef.current?.click()} aria-label="添加文档" title="添加文档">
+                        <FileUp className="size-4" />
                     </button>
                     <textarea
                         ref={inputRef}
@@ -2187,6 +2256,7 @@ export function CodexRemoteConsole() {
                             <div className="space-y-3">
                                 {projects.map((project) => {
                                     const projectActive = activeProject?.id === project.id;
+                                    const projectExpanded = expandedProjectId === project.id;
                                     const switchDisabled = codexBusy || Boolean(pendingPromptRef.current);
                                     const projectThreadGroups = groupedThreads
                                         .map((group) => ({ ...group, threads: group.threads.filter((thread) => !thread.cwd || !project.workspacePath || samePath(thread.cwd, project.workspacePath)) }))
@@ -2198,10 +2268,12 @@ export function CodexRemoteConsole() {
                                                     "flex gap-2 rounded-xl border p-2 transition",
                                                     projectActive
                                                         ? "border-sky-500/45 bg-sky-500/12 text-stone-950 shadow-[0_10px_28px_rgba(14,165,233,.14)] dark:border-sky-400/45 dark:bg-[#0d2631] dark:text-stone-50"
+                                                        : projectExpanded
+                                                          ? "border-sky-400/30 bg-sky-500/[0.06] text-stone-900 dark:border-sky-400/25 dark:bg-sky-400/[0.06] dark:text-stone-100"
                                                         : "border-black/10 bg-white/70 text-stone-900 hover:border-sky-300/45 hover:bg-sky-50 dark:border-white/10 dark:bg-[#151515] dark:text-stone-100 dark:hover:border-sky-400/30 dark:hover:bg-sky-400/10",
                                                 ].join(" ")}
                                             >
-                                                <button type="button" className="min-w-0 flex-1 text-left disabled:opacity-55" onClick={() => void selectProject(project)} disabled={switchDisabled}>
+                                                <button type="button" className="min-w-0 flex-1 text-left" onClick={() => setExpandedProjectId((value) => (value === project.id ? "" : project.id))} aria-expanded={projectExpanded}>
                                                     <div className="flex items-center justify-between gap-2">
                                                         <span className="truncate text-sm font-semibold">{project.label}</span>
                                                         {projectActive ? <span className="shrink-0 rounded-full bg-sky-500/15 px-2 py-0.5 text-[11px] font-medium text-sky-700 dark:text-sky-100">当前</span> : null}
@@ -2219,7 +2291,7 @@ export function CodexRemoteConsole() {
                                                 </div>
                                             </div>
 
-                                            {projectActive ? (
+                                            {projectExpanded ? (
                                                 <div className="ml-3 space-y-2 border-l border-black/10 pl-3 dark:border-white/10">
                                                     {project.threadId ? (
                                                         <button
@@ -2298,7 +2370,7 @@ export function CodexRemoteConsole() {
                                 <p className="mt-1 text-xs leading-5 text-stone-500 dark:text-stone-400">这个页面只连接你自己电脑上的 Codex Remote Bridge；连接配置只保存在当前浏览器中。</p>
                             </div>
                             <p className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-800 dark:text-amber-100">
-                                Agent URL 是电脑上 Codex Remote Bridge 的 HTTPS 服务地址，不是画布网页地址、New API 地址或创作 Agent API。不要把 17371 端口无鉴权裸露到公网。
+                                Agent URL 是电脑上 Codex Remote Bridge 的 HTTPS 服务地址，不是画布网页地址、New API 地址或创作 Agent API。不要把 17372 端口无鉴权裸露到公网。
                             </p>
                             <label className="block">
                                 <span className="text-sm font-medium">Agent URL</span>
@@ -2311,7 +2383,7 @@ export function CodexRemoteConsole() {
                                 <span className="mt-1 block text-xs leading-5 text-stone-500 dark:text-stone-400">本机 Agent 启动输出的 Connect token，不是 Codex API Key。</span>
                             </label>
                             <p className="rounded-2xl border border-sky-500/15 bg-sky-500/10 px-3 py-2 text-xs leading-5 text-sky-800 dark:text-sky-100">
-                                只填上面两项即可。连接成功后会自动列出电脑上的项目，点项目就能进入对应 Codex 会话。
+                                只填上面两项即可。连接成功后会自动列出电脑上的项目；展开项目后，点击具体会话即可进入。
                             </p>
 
                             <div className="rounded-2xl border border-black/10 bg-white/60 p-3 dark:border-white/10 dark:bg-white/[0.05]">

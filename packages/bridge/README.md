@@ -17,7 +17,7 @@ codex-remote-bridge setup \
 - `--token`: 连接令牌；省略时自动生成或保留现有值。
 - `--workspace`: 默认 Codex 工作区。
 - `--host`: 监听地址，默认 `127.0.0.1`。
-- `--port`: 监听端口，默认 `17371`。
+- `--port`: 监听端口，默认 `17372`。
 - `--allowed-origin`: 允许的 Web origin，可重复传入。
 
 配置保存到 `~/.codex-remote/config.json`。之后直接运行 `codex-remote-bridge`。

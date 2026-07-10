@@ -4,6 +4,8 @@ export type AgentAttachment = {
   name?: string;
   type?: string;
   dataUrl?: string;
+  kind?: "image" | "document";
+  size?: number;
 };
 
 export type WorkspaceConfig = {

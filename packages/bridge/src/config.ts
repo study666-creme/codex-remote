@@ -5,7 +5,7 @@ import path from "node:path";
 
 import type { BridgeConfig, WorkspaceConfig } from "./types.js";
 
-export const DEFAULT_PORT = 17371;
+export const DEFAULT_PORT = 17372;
 export const CONFIG_DIR = path.join(os.homedir(), ".codex-remote");
 export const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
 export const VERSION = readPackageVersion();
@@ -18,7 +18,7 @@ export function loadConfig(create = false): BridgeConfig {
   } catch {
     const config = normalizeConfig({
       url: `http://127.0.0.1:${Number(process.env.PORT) || DEFAULT_PORT}`,
-      token: crypto.randomBytes(18).toString("hex"),
+      token: crypto.randomBytes(32).toString("hex"),
     });
     if (create) saveConfig(config);
     return config;
@@ -111,7 +111,7 @@ export function resolveWorkspacePath(value: string) {
 function normalizeConfig(config: BridgeConfig) {
   const token = String(process.env.CODEX_REMOTE_TOKEN || process.env.CANVAS_AGENT_TOKEN || "").trim();
   const publicUrl = String(process.env.CODEX_REMOTE_PUBLIC_URL || process.env.CODEX_REMOTE_URL || process.env.CANVAS_AGENT_PUBLIC_URL || process.env.CANVAS_AGENT_URL || "").trim();
-  if (!config.token) config.token = crypto.randomBytes(18).toString("hex");
+  if (!config.token) config.token = crypto.randomBytes(32).toString("hex");
   if (token) config.token = token;
   if (!config.url) config.url = `http://127.0.0.1:${Number(process.env.PORT) || config.port || DEFAULT_PORT}`;
   if (publicUrl) config.publicUrl = publicUrl.replace(/\/+$/, "");

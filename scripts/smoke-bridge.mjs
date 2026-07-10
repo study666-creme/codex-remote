@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const root = path.resolve(import.meta.dirname, "..");
 const tempRoot = path.join(root, ".tmp");
@@ -13,6 +14,7 @@ await fs.rm(tempHome, { recursive: true, force: true });
 await fs.mkdir(tempHome, { recursive: true });
 
 const entry = path.join(root, "packages", "bridge", "dist", "index.js");
+await testAttachments();
 await runNode([
   entry,
   "setup",
@@ -41,6 +43,7 @@ try {
   assert(unauthorized.status === 401, "Protected endpoint did not reject a missing token.");
 
   const stored = JSON.parse(await fs.readFile(path.join(tempHome, ".codex-remote", "config.json"), "utf8"));
+  assert(/^[0-9a-f]{64}$/.test(stored.token), "Setup did not generate a 32-byte random token.");
   const authorized = await fetch(`http://127.0.0.1:${port}/agent/codex/workspace`, {
     headers: {
       Origin: "https://console.example.com",
@@ -49,7 +52,7 @@ try {
   });
   assert(authorized.status === 200, `Authorized workspace request failed (${authorized.status}).`);
   assert(authorized.headers.get("access-control-allow-origin") === "https://console.example.com", "Allowed CORS origin was not returned.");
-  console.log("Bridge smoke test passed: setup, fixed URL, auth, workspace and CORS.");
+  console.log("Bridge smoke test passed: attachments, setup, fixed URL, auth, workspace and CORS.");
 } finally {
   child.kill();
   await new Promise((resolve) => child.once("exit", resolve));
@@ -87,4 +90,32 @@ async function getJson(url) {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+async function testAttachments() {
+  const agents = await import(pathToFileURL(path.join(root, "packages", "bridge", "dist", "agents.js")).href);
+  const markdown = "# Mobile acceptance\n\n- document upload\n";
+  const prepared = await agents.prepareAttachmentFiles([
+    { name: "reference.png", type: "image/png", kind: "image", dataUrl: `data:image/png;base64,${Buffer.from("image").toString("base64")}` },
+    { name: "acceptance.md", type: "text/markdown", kind: "document", dataUrl: `data:text/markdown;base64,${Buffer.from(markdown).toString("base64")}` },
+  ]);
+  const imagePath = prepared.images[0];
+  const documentPath = prepared.documents[0]?.path;
+  try {
+    assert(Boolean(imagePath), "Image attachment was not prepared.");
+    assert(Boolean(documentPath), "Document attachment was not prepared as a mention.");
+    assert(await fs.readFile(documentPath, "utf8") === markdown, "Document attachment contents changed.");
+  } finally {
+    await agents.cleanupPreparedAttachments(prepared);
+  }
+  await fs.access(imagePath).then(() => { throw new Error("Image attachment was not cleaned up."); }, () => undefined);
+  await fs.access(documentPath).then(() => { throw new Error("Document attachment was not cleaned up."); }, () => undefined);
+
+  let rejected = false;
+  try {
+    await agents.prepareAttachmentFiles([{ name: "unsafe.exe", type: "application/octet-stream", kind: "document", dataUrl: `data:application/octet-stream;base64,${Buffer.from("binary").toString("base64")}` }]);
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "Unsupported document type was accepted.");
 }
