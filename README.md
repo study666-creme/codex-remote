@@ -8,31 +8,49 @@
 
 ## 功能
 
-### 1. 固定 Agent URL
-
-Bridge 支持一次性 `setup`，把公网域名、令牌、工作区和允许的网页来源写入 `~/.codex-remote/config.json`。网页部署时可内置同一个默认域名，以后启动 Bridge 或换手机都不需要修改接口地址。
-
-<img src="apps/web/public/screenshots/01-fixed-url.png" alt="固定 Agent URL 手机设置页" width="390" />
-
-### 2. 手机实时控制 Codex
+### 1. 手机实时控制 Codex
 
 在手机上发任务、查看 Codex 文本和工具事件，并通过 SSE 接收流式状态。任务运行期间发送的新要求会走 `turn/steer`，直接引导当前任务。
 
 <img src="apps/web/public/screenshots/02-mobile-chat.png" alt="Codex 手机实时对话页" width="390" />
 
-### 3. 项目与会话管理
+### 2. 图片、待引导与任务队列
 
-发现本机 Codex 工作区和历史会话，支持切换项目、新建、恢复和归档会话。Bridge 会校验会话所属工作区，避免把会话误接到另一个项目。
+从手机添加图片作为任务上下文。Codex 运行期间可以暂存或立即插入新的引导要求，普通任务也可以排队依次执行。
+
+<img src="apps/web/public/screenshots/04-attachments-queue.png" alt="图片附件、待引导与任务队列手机页" width="390" />
+
+### 3. 需求索引
+
+自动汇总当前会话中的用户需求，可以从侧栏快速查看并跳回原消息，适合跟踪长任务中多轮追加的要求。
+
+<img src="apps/web/public/screenshots/06-requirements-index.png" alt="用户需求索引手机页" width="390" />
+
+### 4. 项目与会话管理
+
+发现本机 Codex 工作区和历史会话，支持切换项目、新建和恢复会话。Bridge 会校验会话所属工作区，避免把会话误接到另一个项目。
 
 <img src="apps/web/public/screenshots/03-workspaces-threads.png" alt="Codex 项目与会话手机页" width="390" />
 
-### 4. 图片附件与任务队列
+### 5. 自定义项目入口
 
-手机图片会作为临时本地文件交给 Codex，任务结束后删除。待办任务可以先加入本机浏览器队列，再按顺序发送。
+可以为常用仓库保存名称、Workspace、默认 Codex Thread ID、Workspace ID 和 Git 仓库路径，之后从手机一键切换。
 
-<img src="apps/web/public/screenshots/04-attachments-queue.png" alt="图片附件与任务队列手机页" width="390" />
+<img src="apps/web/public/screenshots/07-project-editor.png" alt="Codex 项目入口编辑手机页" width="390" />
 
-### 5. 本机 Git 推送
+### 6. 固定 Agent URL
+
+Bridge 支持一次性 `setup`，把公网域名、令牌、工作区和允许的网页来源写入 `~/.codex-remote/config.json`。网页可以内置同一个默认域名，手机只需首次填写连接令牌。
+
+<img src="apps/web/public/screenshots/01-fixed-url.png" alt="固定 Agent URL 手机设置页" width="390" />
+
+### 7. 会话、模型与输出控制
+
+可以指定 Workspace、Workspace ID、Codex Thread ID、模型和推理强度，也可以选择显示完整工具过程、仅文字或仅最终结果。
+
+<img src="apps/web/public/screenshots/08-model-settings.png" alt="Codex 会话模型与输出设置手机页" width="390" />
+
+### 8. 本机 Git 推送
 
 读取工作区内 Git 仓库、分支、远端和未提交状态，确认后把已提交的当前 `HEAD` 推送到选定远端分支。未提交文件不会被手机推送隐式提交。
 
