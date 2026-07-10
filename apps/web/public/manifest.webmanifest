@@ -1,0 +1,9 @@
+{
+  "name": "Codex Remote",
+  "short_name": "Codex",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f4f5f1",
+  "theme_color": "#111816",
+  "icons": []
+}

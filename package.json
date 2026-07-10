@@ -1,0 +1,29 @@
+{
+  "name": "codex-remote-console",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/study666-creme/codex-remote.git"
+  },
+  "homepage": "https://study666-creme.github.io/codex-remote/",
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @codex-remote/web",
+    "build": "npm run build -w @codex-remote/shared && npm run build -w @codex-remote/bridge && npm run build -w @codex-remote/web",
+    "typecheck": "npm run build -w @codex-remote/shared && npm run typecheck -w @codex-remote/bridge && npm run typecheck -w @codex-remote/web",
+    "bridge": "npm run dev -w @codex-remote/bridge",
+    "bridge-setup": "npm run build -w @codex-remote/bridge && node packages/bridge/dist/index.js setup",
+    "bridge-build": "npm run build -w @codex-remote/bridge",
+    "bridge-smoke": "tsx scripts/smoke-bridge.mjs",
+    "web-preview": "npm run preview -w @codex-remote/web"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
