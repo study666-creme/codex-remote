@@ -261,6 +261,11 @@ export default function App() {
       setToast("请先连接桥接服务");
       return;
     }
+    if (!settings.workspacePath.trim()) {
+      setTab("settings");
+      setToast("请先选择项目路径，任务必须绑定工作区");
+      return;
+    }
     const steering = busy && Boolean(settings.threadId);
     setMessages((current) => [...current, { id: crypto.randomUUID(), role: "user", text: value }]);
     setPrompt("");
@@ -368,6 +373,16 @@ export default function App() {
   }
 
   async function newThread() {
+    if (connection !== "connected") {
+      setTab("settings");
+      setToast("请先连接桥接服务");
+      return;
+    }
+    if (!settings.workspacePath.trim()) {
+      setTab("settings");
+      setToast("请先选择项目路径，新会话必须绑定工作区");
+      return;
+    }
     setWorkspaceBusy(true);
     try {
       if (DEMO_MODE) {
@@ -380,6 +395,7 @@ export default function App() {
         setSettings((current) => ({ ...current, threadId: result.thread.id }));
       }
       setMessages([]);
+      setToast(`已在 ${pathName(settings.workspacePath)} 新建会话`);
       setTab("chat");
     } catch (error) {
       setToast(errorMessage(error));
@@ -504,6 +520,10 @@ export default function App() {
         {tab === "workspaces" && (
           <section className="page-view">
             <PageTitle icon={<FolderOpen size={20} />} title="项目与会话" action={<button className="primary-button compact" onClick={newThread}><Plus size={16} />新会话</button>} />
+            <div className="workspace-scope">
+              <span className="workspace-scope-icon"><FolderOpen size={18} /></span>
+              <span><small>新会话工作区</small><strong>{settings.workspacePath || "尚未选择项目"}</strong></span>
+            </div>
             <div className="section-label"><span>本地项目</span><button className="icon-button small" onClick={() => connection === "connected" && connect()} title="刷新"><RefreshCw size={15} /></button></div>
             <div className="project-grid">
               {projects.map((project) => (
