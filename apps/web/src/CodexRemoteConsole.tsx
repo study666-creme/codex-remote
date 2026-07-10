@@ -2370,7 +2370,7 @@ export function CodexRemoteConsole() {
                                 <p className="mt-1 text-xs leading-5 text-stone-500 dark:text-stone-400">这个页面只连接你自己电脑上的 Codex Remote Bridge；连接配置只保存在当前浏览器中。</p>
                             </div>
                             <p className="rounded-2xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-800 dark:text-amber-100">
-                                Agent URL 是电脑上 Codex Remote Bridge 的 HTTPS 服务地址，不是画布网页地址、New API 地址或创作 Agent API。不要把 17372 端口无鉴权裸露到公网。
+                                Agent URL 是电脑上 Codex Remote Bridge 的 HTTPS 服务地址，不是静态 Web 页面地址、New API 地址或创作 Agent API。不要把 17372 端口无鉴权裸露到公网。
                             </p>
                             <label className="block">
                                 <span className="text-sm font-medium">Agent URL</span>
@@ -2420,7 +2420,7 @@ export function CodexRemoteConsole() {
                                     <label className="block">
                                         <span className="text-sm font-medium">Workspace ID</span>
                                         <input value={settings.canvasId} onChange={(event) => updateSettings({ canvasId: event.target.value })} placeholder="default 或项目名" className="mt-2 h-11 w-full rounded-xl border border-black/10 bg-white px-3 outline-none focus:border-stone-500 dark:border-white/10 dark:bg-white/[0.06]" />
-                                        <span className="mt-1 block text-xs leading-5 text-stone-500 dark:text-stone-400">只用于区分本机项目分桶，不是 Codex 会话；旧版 /canvas/019... 仍可兼容。</span>
+                                        <span className="mt-1 block text-xs leading-5 text-stone-500 dark:text-stone-400">只用于区分本机项目分桶，不是 Codex 会话；通常填写项目名即可。</span>
                                     </label>
                                     <label className="block">
                                         <span className="text-sm font-medium">Codex Thread ID</span>
