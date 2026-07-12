@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -15,6 +16,7 @@ await fs.mkdir(tempHome, { recursive: true });
 
 const entry = path.join(root, "packages", "bridge", "dist", "index.js");
 await testAttachments();
+await testEventReplay();
 await runNode([
   entry,
   "setup",
@@ -52,7 +54,7 @@ try {
   });
   assert(authorized.status === 200, `Authorized workspace request failed (${authorized.status}).`);
   assert(authorized.headers.get("access-control-allow-origin") === "https://console.example.com", "Allowed CORS origin was not returned.");
-  console.log("Bridge smoke test passed: attachments, setup, fixed URL, auth, workspace and CORS.");
+  console.log("Bridge smoke test passed: attachments, SSE replay, setup, fixed URL, auth, workspace and CORS.");
 } finally {
   child.kill();
   await new Promise((resolve) => child.once("exit", resolve));
@@ -118,4 +120,50 @@ async function testAttachments() {
     rejected = true;
   }
   assert(rejected, "Unsupported document type was accepted.");
+}
+
+async function testEventReplay() {
+  class FakeEventResponse extends EventEmitter {
+    chunks = [];
+    headers = {};
+    destroyed = false;
+    socket = { setKeepAlive() {} };
+
+    writeHead(_status, headers) {
+      this.headers = headers;
+    }
+
+    flushHeaders() {}
+
+    write(chunk) {
+      this.chunks.push(String(chunk));
+      return true;
+    }
+
+    end() {
+      this.close();
+    }
+
+    close() {
+      if (this.destroyed) return;
+      this.destroyed = true;
+      this.emit("close");
+    }
+  }
+
+  const { EventHub } = await import(pathToFileURL(path.join(root, "packages", "bridge", "dist", "events.js")).href);
+  const hub = new EventHub();
+  const first = new FakeEventResponse();
+  hub.openEvents(new URL("http://127.0.0.1/events?clientId=mobile-test"), first);
+  hub.emitAll("agent_event", { sequence: 1 });
+  hub.emitAll("agent_event", { sequence: 2 });
+  first.close();
+
+  const resumed = new FakeEventResponse();
+  hub.openEvents(new URL("http://127.0.0.1/events?clientId=mobile-test"), resumed, "1");
+  const replay = resumed.chunks.join("");
+  assert(!replay.includes('"sequence":1'), "SSE replay resent an event the client had already received.");
+  assert(replay.includes('"sequence":2'), "SSE replay did not restore the event missed during reconnect.");
+  assert(resumed.headers["Cache-Control"] === "no-cache, no-transform", "SSE response did not disable proxy transformation.");
+  resumed.close();
 }

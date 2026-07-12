@@ -77,7 +77,7 @@ export function startHttpServer() {
     res.status(401).json({ ok: false, error: "invalid token" });
   });
 
-  app.get("/events", (req, res) => events.openEvents(requestUrl(req, config), res));
+  app.get("/events", (req, res) => events.openEvents(requestUrl(req, config), res, req.get("last-event-id")));
   app.get("/agent/codex/workspace", (req, res) => {
     const workspace = ensureWorkspace(config, requestWorkspaceId(req));
     res.json({ ok: true, workspace });

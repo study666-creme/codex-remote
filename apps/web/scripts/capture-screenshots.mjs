@@ -79,7 +79,7 @@ try {
     browser = await chromium.launch({ channel: "msedge", headless: true });
   }
 
-  async function createPage({ queue = [], guides = [], busy = false } = {}) {
+  async function createPage({ queue = [], guides = [], busy = false, agentHandler = null } = {}) {
     const page = await browser.newPage({
       viewport: { width: 390, height: 844 },
       deviceScaleFactor: 1,
@@ -106,12 +106,14 @@ try {
       const url = new URL(request.url());
       const headers = { "access-control-allow-origin": "*", "content-type": "application/json" };
       if (request.method() === "OPTIONS") return route.fulfill({ status: 204, headers });
+      const customResponse = await agentHandler?.({ request, url, headers });
+      if (customResponse) return route.fulfill(customResponse);
       if (url.pathname === "/agent/codex/workspace") return route.fulfill({ status: 200, headers, json: { ok: true, workspace } });
       if (url.pathname === "/agent/codex/workspaces") return route.fulfill({ status: 200, headers, json: { ok: true, projects, data: threads } });
       if (url.pathname === "/agent/codex/threads") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, data: threads.filter((item) => item.cwd === workspace.workspacePath) } });
       if (url.pathname === "/agent/codex/status") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, busy, canSteer: busy, activeTurnId: busy ? "turn-a" : "", thread: threads[0] } });
       if (url.pathname === "/agent/git/repos") return route.fulfill({ status: 200, headers, json: { ok: true, workspace, repos } });
-      if (url.pathname.startsWith("/agent/codex/threads/")) return route.fulfill({ status: 200, headers, json: { ok: true, workspace, messages: busy ? thinkingMessages : messages } });
+      if (url.pathname.startsWith("/agent/codex/threads/")) return route.fulfill({ status: 200, headers, json: { ok: true, workspace, messages: busy ? thinkingMessages : messages, busy } });
       return route.fulfill({ status: 200, headers, json: { ok: true } });
     });
 
@@ -204,6 +206,48 @@ try {
   await page.getByText("当前分支：codex/mobile-login", { exact: true }).waitFor();
   await page.getByRole("button", { name: "推送所选仓库已提交 HEAD" }).scrollIntoViewIfNeeded();
   await capture(page, "05-git-push.png");
+
+  const delayedPrompt = "验证旧同步记录不会覆盖这条新指令";
+  const delayedReply = "新一轮记录已经同步完成。";
+  let turnAccepted = false;
+  let historyComplete = false;
+  page = await createPage({
+    agentHandler: async ({ request, url, headers }) => {
+      if (url.pathname === "/agent/codex/turn" && request.method() === "POST") {
+        turnAccepted = true;
+        return { status: 200, headers, json: { ok: true, threadId: "thread-a" } };
+      }
+      if (turnAccepted && url.pathname === "/agent/codex/threads/thread-a" && request.method() === "GET") {
+        return {
+          status: 200,
+          headers,
+          json: {
+            ok: true,
+            workspace,
+            busy: !historyComplete,
+            messages: historyComplete
+              ? [...messages, { id: "m-delayed-user", role: "user", text: delayedPrompt }, { id: "m-delayed-reply", role: "assistant", title: "Codex", text: delayedReply }]
+              : messages,
+          },
+        };
+      }
+      return null;
+    },
+  });
+  await page.locator("textarea").fill(delayedPrompt);
+  const turnRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/agent/codex/turn");
+  await page.getByRole("button", { name: "发送" }).click();
+  await turnRequest;
+  await page.getByText(delayedPrompt, { exact: true }).waitFor({ timeout: 750 });
+  await page.waitForTimeout(2800);
+  if (!(await page.getByText(delayedPrompt, { exact: true }).isVisible())) throw new Error("Pending user message disappeared after a stale thread sync");
+  const pendingRunStillStored = await page.evaluate(() => Boolean(localStorage.getItem("codex-remote-mobile:pending-run")));
+  if (!pendingRunStillStored) throw new Error("A stale thread sync incorrectly marked the pending turn complete");
+  historyComplete = true;
+  await page.getByText(delayedReply, { exact: true }).waitFor({ timeout: 10_000 });
+  await page.waitForFunction(() => !localStorage.getItem("codex-remote-mobile:pending-run"), undefined, { timeout: 3000 });
+  await page.close();
+  console.log("Verified pending messages survive stale thread sync");
 } finally {
   await browser?.close();
   await server.close();

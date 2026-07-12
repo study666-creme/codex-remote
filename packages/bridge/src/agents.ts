@@ -9,7 +9,7 @@ import type { AgentAttachment, AgentEmit } from "./types.js";
 
 type Json = Record<string, unknown>;
 type AgentEvent = Json & { type: string; usage?: unknown };
-type PendingRequest = { resolve: (value: unknown) => void; reject: (error: Error) => void };
+type PendingRequest = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> };
 type CodexModelOptions = { model?: string; effort?: string };
 type CodexRunOptions = { threadId?: string; cwd?: string } & CodexModelOptions;
 type DocumentMention = { name: string; path: string };
@@ -25,8 +25,22 @@ type AgentHistoryMessage = {
 
 let codexQueue: Promise<unknown> = Promise.resolve();
 let codexApp: CodexAppClient | null = null;
+let codexAppStart: Promise<CodexAppClient> | null = null;
 let codexThreadId = "";
 const require = createRequire(import.meta.url);
+
+function getCodexApp(emit: AgentEmit) {
+  if (codexApp) return Promise.resolve(codexApp);
+  codexAppStart ||= CodexAppClient.start(emit)
+    .then((client) => {
+      codexApp = client;
+      return client;
+    })
+    .finally(() => {
+      codexAppStart = null;
+    });
+  return codexAppStart;
+}
 
 export async function runCodexTurn(
   prompt: string,
@@ -50,13 +64,13 @@ export async function steerCodexTurn(
   let cleanupDeferred = false;
   try {
     prepared = await prepareAttachmentFiles(attachments);
-    codexApp ||= await CodexAppClient.start(emit);
-    let activeTurnId = codexApp.activeTurnId(options.threadId);
+    const app = await getCodexApp(emit);
+    let activeTurnId = app.activeTurnId(options.threadId);
     if (!activeTurnId) {
       const thread = await loadCodexThread(emit, options.threadId, options.cwd, true);
       activeTurnId = activeTurnIdFromThread(thread);
     }
-    await codexApp.steerTurn(options.threadId, prompt, prepared.images, prepared.documents, activeTurnId);
+    await app.steerTurn(options.threadId, prompt, prepared.images, prepared.documents, activeTurnId);
     if (prepared.documents.length) {
       deferAttachmentCleanup(prepared);
       cleanupDeferred = true;
@@ -67,10 +81,10 @@ export async function steerCodexTurn(
 }
 
 export async function getCodexThreadStatus(emit: AgentEmit, threadId: string, cwd?: string) {
-  codexApp ||= await CodexAppClient.start(emit);
+  const app = await getCodexApp(emit);
   const result = threadId ? await loadCodexThread(emit, threadId, cwd, true) : null;
   const thread = result ? summarizeCodexThread(result) : null;
-  const localActiveTurnId = codexApp.activeTurnId(threadId);
+  const localActiveTurnId = app.activeTurnId(threadId);
   const inferredActiveTurnId = localActiveTurnId ? "" : activeTurnIdFromThread(result);
   const activeTurnId = localActiveTurnId || inferredActiveTurnId || "";
   const busy = Boolean(activeTurnId) || busyStatus(String(thread?.status || ""));
@@ -82,9 +96,9 @@ async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: Age
   let cleanupDeferred = false;
   try {
     prepared = await prepareAttachmentFiles(attachments);
-    codexApp ||= await CodexAppClient.start(emit);
-    const threadId = await ensureCodexThread(codexApp, options);
-    await codexApp.startTurn(threadId, prompt, prepared.images, prepared.documents, options);
+    const app = await getCodexApp(emit);
+    const threadId = await ensureCodexThread(app, options);
+    await app.startTurn(threadId, prompt, prepared.images, prepared.documents, options);
     if (prepared.documents.length) {
       deferAttachmentCleanup(prepared);
       cleanupDeferred = true;
@@ -97,8 +111,8 @@ async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: Age
 }
 
 export async function startCodexThread(emit: AgentEmit, cwd?: string, options: CodexModelOptions = {}) {
-  codexApp ||= await CodexAppClient.start(emit);
-  const thread = await codexApp.startThread(cwd, options);
+  const app = await getCodexApp(emit);
+  const thread = await app.startThread(cwd, options);
   codexThreadId = String(field(thread, "id") || "");
   return thread;
 }
@@ -109,9 +123,9 @@ export async function resumeCodexThread(
   cwd?: string,
   options: CodexModelOptions = {},
 ) {
-  codexApp ||= await CodexAppClient.start(emit);
+  const app = await getCodexApp(emit);
   await loadCodexThread(emit, threadId, cwd, false);
-  const thread = await codexApp.resumeThread(threadId, cwd, options);
+  const thread = await app.resumeThread(threadId, cwd, options);
   assertThreadWorkspace(thread, cwd);
   codexThreadId = String(field(thread, "id") || threadId);
   return { thread, messages: threadMessages(thread) };
@@ -121,8 +135,8 @@ export async function listCodexThreads(
   emit: AgentEmit,
   options: { cwd?: string; searchTerm?: string; limit?: number },
 ) {
-  codexApp ||= await CodexAppClient.start(emit);
-  const result = await codexApp.listThreads({
+  const app = await getCodexApp(emit);
+  const result = await app.listThreads({
     limit: options.limit || 40,
     sortKey: "updated_at",
     sortDirection: "desc",
@@ -144,7 +158,14 @@ export async function listCodexThreads(
 
 export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: string) {
   const thread = await loadCodexThread(emit, threadId, cwd, true);
-  return { thread: summarizeCodexThread(thread), messages: threadMessages(thread) };
+  const summary = summarizeCodexThread(thread);
+  const activeTurnId = codexApp?.activeTurnId(threadId) || activeTurnIdFromThread(thread);
+  return {
+    thread: summary,
+    messages: threadMessages(thread),
+    busy: Boolean(activeTurnId) || busyStatus(summary.status),
+    activeTurnId,
+  };
 }
 
 export async function verifyCodexThreadWorkspace(emit: AgentEmit, threadId: string, cwd: string) {
@@ -152,9 +173,9 @@ export async function verifyCodexThreadWorkspace(emit: AgentEmit, threadId: stri
 }
 
 export async function archiveCodexThread(emit: AgentEmit, threadId: string, cwd?: string) {
-  codexApp ||= await CodexAppClient.start(emit);
+  const app = await getCodexApp(emit);
   await loadCodexThread(emit, threadId, cwd, false);
-  await codexApp.archiveThread(threadId);
+  await app.archiveThread(threadId);
 }
 
 async function ensureCodexThread(app: CodexAppClient, options: CodexRunOptions) {
@@ -197,8 +218,10 @@ class CodexAppClient {
     child.on("error", (error) => emit("agent_error", { message: error.message }));
     child.on("exit", (code) => {
       client.failAll(`Codex app-server exited: ${code ?? 0}`);
-      codexApp = null;
-      codexThreadId = "";
+      if (codexApp === client) {
+        codexApp = null;
+        codexThreadId = "";
+      }
       emit("agent_log", { text: `Codex app-server exited: ${code ?? 0}` });
     });
     await client.request("initialize", {
@@ -287,7 +310,18 @@ class CodexAppClient {
   private request(method: string, params: unknown) {
     const id = this.nextId++;
     this.write({ id, method, params });
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`Codex app-server request timed out: ${method}`));
+        if (codexApp === this) {
+          codexApp = null;
+          codexThreadId = "";
+        }
+        this.child.kill();
+      }, 30_000);
+      this.pending.set(id, { resolve, reject, timer });
+    });
   }
 
   private notify(method: string, params?: unknown) {
@@ -377,6 +411,7 @@ class CodexAppClient {
     const pending = this.pending.get(id);
     if (!pending) return;
     this.pending.delete(id);
+    if (pending.timer) clearTimeout(pending.timer);
     pending.resolve(result);
   }
 
@@ -384,11 +419,15 @@ class CodexAppClient {
     const pending = this.pending.get(id);
     if (!pending) return;
     this.pending.delete(id);
+    if (pending.timer) clearTimeout(pending.timer);
     pending.reject(new Error(message));
   }
 
   private failAll(message: string) {
-    [...this.pending.values(), ...this.activeTurns.values()].forEach((item) => item.reject(new Error(message)));
+    [...this.pending.values(), ...this.activeTurns.values()].forEach((item) => {
+      if (item.timer) clearTimeout(item.timer);
+      item.reject(new Error(message));
+    });
     this.pending.clear();
     this.activeTurns.clear();
     this.activeTurnByThread.clear();
@@ -439,8 +478,8 @@ function normalizeCodexNotification(method: string, params: Json): AgentEvent | 
 }
 
 async function loadCodexThread(emit: AgentEmit, threadId: string, cwd: string | undefined, includeTurns: boolean) {
-  codexApp ||= await CodexAppClient.start(emit);
-  const result = await codexApp.readThread(threadId, includeTurns);
+  const app = await getCodexApp(emit);
+  const result = await app.readThread(threadId, includeTurns);
   const thread = field(result, "thread") || {};
   assertThreadWorkspace(thread, cwd);
   return thread;

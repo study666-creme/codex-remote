@@ -903,30 +903,9 @@ export function CodexRemoteConsole() {
         setDemoNoticeOpen(false);
     }
 
-    async function refreshRemoteBusy(options: { quiet?: boolean } = {}) {
-        const currentSettings = settingsRef.current;
-        const threadId = activeThreadIdRef.current || normalizeThreadId(currentSettings.threadId);
-        if (!currentSettings.agentUrl.trim() || !currentSettings.token.trim() || !threadId) {
-            setRemoteBusy(false);
-            return false;
-        }
-        try {
-            const workspaceId = normalizeCanvasId(currentSettings.canvasId);
-            const query = workspaceSearchParams(workspaceId, { threadId });
-            const data = await agentFetch<{ busy?: boolean; activeTurnId?: string; canSteer?: boolean; thread?: ThreadSummary }>(`/agent/codex/status?${query.toString()}`);
-            const busy = Boolean(data.busy);
-            setRemoteBusy(busy);
-            if (busy && !options.quiet) setTemporaryStatus(data.activeTurnId || data.canSteer ? "Codex 正在运行，可点“引导”影响当前任务。" : "当前会话正在运行，新输入会先悬浮为待引导。");
-            if (!busy && data.thread?.status) setRunStatus("");
-            return busy;
-        } catch {
-            return false;
-        }
-    }
-
     async function currentTurnBusy() {
         if (sending || pendingPromptRef.current || activeQueueTaskIdRef.current || remoteBusy) return true;
-        return await refreshRemoteBusy({ quiet: true });
+        return false;
     }
 
     async function confirmPendingGuide(id: string, extraGuide = "") {
@@ -1027,7 +1006,7 @@ export function CodexRemoteConsole() {
     function promptIndex(items: MobileMessage[], prompt: string) {
         if (!prompt.trim()) return -1;
         for (let index = items.length - 1; index >= 0; index -= 1) {
-            if (items[index]?.role === "user" && sameText(items[index].text, prompt)) return index;
+            if (items[index]?.role === "user" && (sameText(items[index].text, prompt) || items[index].text.trim().startsWith(`${prompt.trim()}\n\n[附件：`))) return index;
         }
         return -1;
     }
@@ -1039,9 +1018,7 @@ export function CodexRemoteConsole() {
 
     function hasTurnCompletion(items: MobileMessage[], prompt: string) {
         if (!prompt.trim()) return items.some((item) => item.role === "assistant" || item.role === "error");
-        if (hasReplyAfterPrompt(items, prompt)) return true;
-        const lastUserIndex = items.findLastIndex((item) => item.role === "user");
-        return items.slice(Math.max(0, lastUserIndex + 1)).some((item) => item.role === "assistant" || item.role === "error");
+        return hasReplyAfterPrompt(items, prompt);
     }
 
     function applyThreadMessages(items: MobileMessage[] | undefined, pendingPrompt = "", options: { requirePromptMatch?: boolean; forceScroll?: boolean } = {}) {
@@ -1052,7 +1029,26 @@ export function CodexRemoteConsole() {
             atBottomRef.current = true;
             setUnreadCount(0);
         }
-        setMessages(visibleItems);
+        setMessages((currentItems) => {
+            if (!pendingPrompt) return visibleItems;
+            const localPromptIndex = promptIndex(currentItems, pendingPrompt);
+            if (localPromptIndex < 0) return visibleItems;
+            const localTurn = currentItems.slice(localPromptIndex);
+            const remotePromptIndex = promptIndex(visibleItems, pendingPrompt);
+            if (remotePromptIndex < 0) return [...visibleItems, ...localTurn].slice(-140);
+
+            const merged = [...visibleItems];
+            localTurn.slice(1).forEach((localMessage) => {
+                const key = localMessage.streamId || localMessage.id;
+                const remoteIndex = merged.findIndex((remoteMessage) => (remoteMessage.streamId || remoteMessage.id) === key);
+                if (remoteIndex < 0) {
+                    merged.push(localMessage);
+                    return;
+                }
+                if (localMessage.text.length > merged[remoteIndex].text.length) merged[remoteIndex] = localMessage;
+            });
+            return merged.slice(-140);
+        });
         return visibleItems;
     }
 
@@ -1067,14 +1063,20 @@ export function CodexRemoteConsole() {
                 return;
             }
             void refreshThreadMessages(threadId, canvasId, prompt)
-                .then((items) => {
-                    if (items.length) finishCurrentTurn("本轮完成", true);
-                    else finishCurrentTurn("本轮完成", true);
+                .then(({ items, busy }) => {
+                    if (!busy && hasTurnCompletion(items, prompt)) {
+                        finishCurrentTurn("本轮完成", true);
+                        return;
+                    }
+                    setTemporaryStatus(busy ? "Codex 仍在执行，继续同步中..." : "本轮完成，正在等待最新记录...");
+                    stopThreadPoll();
+                    pollThreadUntilReply(threadId, canvasId, prompt);
                 })
                 .catch(() => {
-                    finishCurrentTurn("本轮完成", true);
+                    stopThreadPoll();
+                    pollThreadUntilReply(threadId, canvasId, prompt);
                 });
-        }, 7000);
+        }, 1200);
     }
 
     async function autoSyncFromAgent(reason: "foreground" | "interval" | "offline" = "interval") {
@@ -1111,25 +1113,35 @@ export function CodexRemoteConsole() {
         const currentSettings = settingsRef.current;
         const mistake = agentUrlMistakeMessage(currentSettings.agentUrl);
         if (mistake) throw new Error(mistake);
-        const response = await fetch(`${endpoint(currentSettings.agentUrl)}${targetPath}`, {
-            ...init,
-            headers: { "Content-Type": "application/json", "x-canvas-agent-token": currentSettings.token.trim(), ...(init?.headers || {}) },
-        });
-        const payload = (await response.json().catch(() => ({}))) as T & { error?: string; msg?: string };
-        if (!response.ok) {
-            if (response.status === 404) throw new Error(`${agentUrlMistakeMessage(currentSettings.agentUrl) || "Agent 请求 404。请确认 Agent URL 指向的是正在运行的 Codex Remote Bridge，而不是网页地址；如果地址正确，请重启电脑端 bridge 以更新接口。"} 请求路径：${targetPath}`);
-            throw new Error(payload.error || payload.msg || `Agent 请求失败：${response.status}`);
+        const controller = init?.signal ? null : new AbortController();
+        const timeout = window.setTimeout(() => controller?.abort(), init?.method === "POST" ? 45_000 : 20_000);
+        try {
+            const response = await fetch(`${endpoint(currentSettings.agentUrl)}${targetPath}`, {
+                ...init,
+                signal: init?.signal || controller?.signal,
+                headers: { "Content-Type": "application/json", "x-canvas-agent-token": currentSettings.token.trim(), ...(init?.headers || {}) },
+            });
+            const payload = (await response.json().catch(() => ({}))) as T & { error?: string; msg?: string };
+            if (!response.ok) {
+                if (response.status === 404) throw new Error(`${agentUrlMistakeMessage(currentSettings.agentUrl) || "Agent 请求 404。请确认 Agent URL 指向的是正在运行的 Codex Remote Bridge，而不是网页地址；如果地址正确，请重启电脑端 bridge 以更新接口。"} 请求路径：${targetPath}`);
+                throw new Error(payload.error || payload.msg || `Agent 请求失败：${response.status}`);
+            }
+            return payload;
+        } catch (error) {
+            if (error && typeof error === "object" && "name" in error && error.name === "AbortError") throw new Error("Agent 请求超时，请检查电脑 Bridge 和网络连接后重试。");
+            throw error;
+        } finally {
+            window.clearTimeout(timeout);
         }
-        return payload;
     };
 
     const refreshThreadMessages = async (threadId: string, canvasId: string, pendingPrompt = "", options: { forceScroll?: boolean } = {}) => {
-        const data = await agentFetch<{ workspace?: Workspace; messages?: MobileMessage[] }>(`/agent/codex/threads/${encodeURIComponent(threadId)}?${workspaceSearchParams(canvasId).toString()}`);
+        const data = await agentFetch<{ workspace?: Workspace; messages?: MobileMessage[]; busy?: boolean }>(`/agent/codex/threads/${encodeURIComponent(threadId)}?${workspaceSearchParams(canvasId).toString()}`);
         if (data.workspace) {
             setWorkspace(data.workspace);
             setActiveThreadId(data.workspace.activeThreadId || threadId);
         }
-        return applyThreadMessages(data.messages, pendingPrompt, options);
+        return { items: applyThreadMessages(data.messages, pendingPrompt, options), busy: Boolean(data.busy) };
     };
 
     const syncThreadInBackground = async (threadId: string, canvasId: string, options: { forceScroll?: boolean; clearWhenEmpty?: boolean; statusText?: string } = {}) => {
@@ -1257,16 +1269,15 @@ export function CodexRemoteConsole() {
         stopThreadPoll();
         pollingRunKeyRef.current = runKey;
         writePendingRun({ threadId, canvasId, prompt, startedAt: Date.now() });
-        if (settingsRef.current.receiveMode === "final" && eventSourceRef.current?.readyState === EventSource.OPEN) return;
         let attempts = 0;
         let consecutiveFailures = 0;
         const tick = async () => {
             if (syncPausedRef.current || pollingRunKeyRef.current !== runKey) return;
             attempts += 1;
             try {
-                const items = await refreshThreadMessages(threadId, canvasId, prompt);
+                const { items, busy } = await refreshThreadMessages(threadId, canvasId, prompt);
                 consecutiveFailures = 0;
-                if (hasTurnCompletion(items, prompt)) {
+                if (!busy && hasTurnCompletion(items, prompt)) {
                     finishCurrentTurn("本轮完成", true);
                     return;
                 }
@@ -1302,8 +1313,8 @@ export function CodexRemoteConsole() {
                 updateSettings({ threadId: pendingRun.threadId, canvasId: pendingRun.canvasId });
             }
             try {
-                const items = await refreshThreadMessages(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
-                if (hasTurnCompletion(items, pendingRun.prompt)) {
+                const { items, busy } = await refreshThreadMessages(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
+                if (!busy && hasTurnCompletion(items, pendingRun.prompt)) {
                     finishCurrentTurn("已同步最新结果", true);
                     return;
                 }
@@ -1435,7 +1446,7 @@ export function CodexRemoteConsole() {
                     });
                 }
             }
-            if (options.syncOnly) return true;
+            if (options.syncOnly && eventSourceRef.current && eventSourceRef.current.readyState !== EventSource.CLOSED) return true;
 
             const source = new EventSource(withToken(agentEndpoint, `/events?clientId=mobile-codex-${Date.now()}`, settingsRef.current.token));
             eventSourceRef.current = source;
@@ -1463,8 +1474,8 @@ export function CodexRemoteConsole() {
                     failCurrentTurn("没有可同步的 Codex 会话");
                     return;
                 }
-                void refreshThreadMessages(threadId, canvasId, pendingPrompt).then((items) => {
-                    if (!pendingPrompt || hasTurnCompletion(items, pendingPrompt)) {
+                void refreshThreadMessages(threadId, canvasId, pendingPrompt).then(({ items, busy }) => {
+                    if (!busy && (!pendingPrompt || hasTurnCompletion(items, pendingPrompt))) {
                         finishCurrentTurn("本轮完成", true);
                     } else {
                         scheduleCompletionFallback();
@@ -1708,18 +1719,22 @@ export function CodexRemoteConsole() {
             pushMessage({ id: createId(), role: "error", title: "发送失败", text: "请先填写 Agent URL 和 Token。" });
             return false;
         }
-        if (!connected) {
-            const ok = await connect({ quiet: true });
-            if (!ok) {
-                if (options.queuedTaskId) markActiveQueueTask("queued");
-                return false;
-            }
-        }
         setSending(true);
         pendingPromptRef.current = prompt;
         setTemporaryStatus("Codex 正在接收任务...");
         pushMessage({ id: createId(), role: "user", text: currentAttachments.length ? `${prompt}\n\n[附件：${attachmentSummary(currentAttachments)}]` : prompt });
         upsertStreamMessage({ id: "turn-status", role: "status", text: "Codex 正在处理..." });
+        if (!connected) {
+            const ok = await connect({ quiet: true });
+            if (!ok) {
+                setSending(false);
+                pendingPromptRef.current = "";
+                setTemporaryStatus("");
+                setAttachments(currentAttachments);
+                if (options.queuedTaskId) markActiveQueueTask("queued");
+                return false;
+            }
+        }
         try {
             const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
             const targetThreadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
