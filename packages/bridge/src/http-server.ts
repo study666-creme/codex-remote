@@ -18,8 +18,7 @@ import {
   archiveCodexThread,
   getCodexThreadStatus,
   listCodexThreads,
-  readCodexThread,
-  resumeCodexThread,
+  readCodexThreadFast,
   runCodexTurn,
   startCodexThread,
   steerCodexTurn,
@@ -121,14 +120,18 @@ export function startHttpServer() {
   app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
     const workspace = ensureWorkspace(config, requestWorkspaceId(req));
     const threadId = routeParam(req.params.threadId);
-    res.json({ ok: true, workspace, ...(await readCodexThread(emit, threadId, workspace.workspacePath)) });
+    res.json({ ok: true, workspace, ...(await readCodexThreadFast(emit, threadId, workspace.workspacePath)) });
   }));
   app.post("/agent/codex/threads/:threadId/resume", route(async (req, res) => {
-    const workspace = ensureWorkspace(config, requestWorkspaceId(req));
+    const initialWorkspace = ensureWorkspace(config, requestWorkspaceId(req));
+    const workspacePath = String(req.body?.workspacePath || "").trim();
+    const workspace = workspacePath
+      ? updateWorkspace(config, initialWorkspace.workspaceId, { workspacePath })
+      : initialWorkspace;
     const threadId = routeParam(req.params.threadId);
     const modelOptions = requestCodexModelOptions(req, workspace);
     const saved = rememberCodexModelOptions(config, workspace, modelOptions);
-    const result = await resumeCodexThread(emit, threadId, saved.workspacePath, modelOptions);
+    const result = await readCodexThreadFast(emit, threadId, saved.workspacePath);
     const nextWorkspace = updateWorkspace(config, saved.workspaceId, { activeThreadId: threadId });
     res.json({ ok: true, workspace: nextWorkspace, ...result });
   }));
@@ -324,6 +327,7 @@ function codexWorkspaceProjects(config: BridgeConfig, threads: CodexThreadSummar
     });
   });
   return [...projects.values()].sort((a, b) => {
+    if (Boolean(a.threadCount) !== Boolean(b.threadCount)) return a.threadCount ? -1 : 1;
     if (a.source !== b.source) return a.source === "saved" ? -1 : 1;
     return (b.updatedAt || 0) - (a.updatedAt || 0) || a.label.localeCompare(b.label);
   });

@@ -184,6 +184,31 @@ try {
 
   page = await createPage();
   await page.getByRole("button", { name: "打开侧边栏" }).click();
+  await page.getByText("商品列表性能", { exact: true }).waitFor();
+  const catalogRefresh = page.waitForRequest((request) => new URL(request.url()).pathname === "/agent/codex/workspaces");
+  await page.getByRole("button", { name: "刷新会话" }).click();
+  await catalogRefresh;
+  const switchRequests = [];
+  page.on("request", (request) => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.startsWith("/agent/")) switchRequests.push({ pathname, method: request.method(), body: request.postDataJSON?.() });
+  });
+  const threadSwitch = page.waitForRequest((request) => new URL(request.url()).pathname === "/agent/codex/threads/thread-a2/resume");
+  await page.getByText("商品列表性能", { exact: true }).click();
+  await threadSwitch;
+  await page.waitForTimeout(300);
+  const expensiveSwitchRequests = switchRequests.filter(({ pathname }) => pathname === "/agent/codex/workspaces" || pathname === "/agent/codex/workspace" || pathname === "/agent/git/repos");
+  if (expensiveSwitchRequests.length) throw new Error(`Conversation switch made expensive requests: ${expensiveSwitchRequests.map(({ pathname }) => pathname).join(", ")}`);
+  const resumeRequests = switchRequests.filter(({ pathname }) => pathname.endsWith("/resume"));
+  if (resumeRequests.length !== 1) throw new Error(`Conversation switch requested ${resumeRequests.length} resume calls`);
+  if (resumeRequests[0]?.body?.workspacePath !== workspace.workspacePath) throw new Error("Conversation switch did not send its workspace path");
+  const switchedSettings = await page.evaluate(() => JSON.parse(localStorage.getItem("codex-remote-mobile:settings") || "{}"));
+  if (switchedSettings.threadId !== "thread-a2") throw new Error("Conversation switch did not persist the selected thread");
+  await page.close();
+  console.log("Verified full catalog refresh and one-request conversation switching");
+
+  page = await createPage();
+  await page.getByRole("button", { name: "打开侧边栏" }).click();
   await page.getByRole("button", { name: "新增项目" }).click();
   await page.getByText("新增项目", { exact: true }).waitFor();
   await capture(page, "07-project-editor.png");

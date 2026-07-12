@@ -39,14 +39,17 @@ type PendingGuide = { id: string; text: string; attachments: AgentAttachment[]; 
 type ThreadGroup = { key: string; label: string; path: string; threads: ThreadSummary[] };
 type ProjectPreset = { id: string; label: string; canvasId: string; workspaceId?: string; workspacePath: string; threadId: string; gitRepoPath?: string };
 type ProjectDraft = { label: string; canvasId: string; workspacePath: string; threadId: string; gitRepoPath: string };
+type ThreadCatalogCache = { updatedAt: number; threads: ThreadSummary[]; projects: ProjectPreset[] };
 
 const settingsKey = "codex-remote-mobile:settings";
 const messagesKey = "codex-remote-mobile:messages";
+const threadMessagesKey = "codex-remote-mobile:thread-messages";
 const pendingRunKey = "codex-remote-mobile:pending-run";
 const queueKey = "codex-remote-mobile:task-queue";
 const pendingGuideKey = "codex-remote-mobile:pending-guide";
 const activeProjectKey = "codex-remote-mobile:active-project";
 const projectsKey = "codex-remote-mobile:projects";
+const threadCatalogKey = "codex-remote-mobile:thread-catalog";
 const dailyUsageKey = "codex-remote-mobile:daily-usage";
 const quotaUnlockKey = "codex-remote-mobile:quota-unlocked";
 const demoNoticeKey = "codex-remote-mobile:demo-notice-dismissed";
@@ -54,6 +57,7 @@ const codexRemoteDemoMode = false;
 const codexRemoteDailyTurnLimit = 10;
 const defaultAgentUrl = String(import.meta.env.VITE_CODEX_REMOTE_DEFAULT_AGENT_URL || "").trim();
 const pendingRunMaxAge = 1000 * 60 * 60 * 12;
+const threadCatalogMaxAge = 1000 * 60 * 60 * 24 * 7;
 const maxAttachmentCount = 6;
 const maxAttachmentBytes = 8 * 1024 * 1024;
 const documentAccept = ".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.md,.markdown,.csv,.tsv,.json,.jsonl,.yaml,.yml,.xml,.html,.htm,.rtf,.log,.js,.jsx,.ts,.tsx,.py,.java,.c,.h,.cpp,.hpp,.cs,.go,.rs,.rb,.php,.sh,.ps1,.sql,.toml,.ini,.cfg";
@@ -443,6 +447,31 @@ function readFileAsDataUrl(file: File, kind: "image" | "document") {
     });
 }
 
+function threadMessagesStorageKey(threadId: string) {
+    return `${threadMessagesKey}:${normalizeThreadId(threadId)}`;
+}
+
+function readStoredThreadMessages(threadId: string) {
+    if (typeof localStorage === "undefined" || !normalizeThreadId(threadId)) return null;
+    const stored = localStorage.getItem(threadMessagesStorageKey(threadId));
+    return stored === null ? null : readJson<MobileMessage[]>(stored, []);
+}
+
+function readThreadCatalog() {
+    if (typeof localStorage === "undefined") return { threads: [], projects: [] };
+    const value = readJson<ThreadCatalogCache | null>(localStorage.getItem(threadCatalogKey), null);
+    if (!value || Date.now() - Number(value.updatedAt || 0) > threadCatalogMaxAge) return { threads: [], projects: [] };
+    return { threads: value.threads || [], projects: normalizeProjectList(value.projects || []) };
+}
+
+function writeThreadCatalog(threads: ThreadSummary[], projects: ProjectPreset[]) {
+    try {
+        localStorage.setItem(threadCatalogKey, JSON.stringify({ updatedAt: Date.now(), threads, projects: normalizeProjectList(projects) } satisfies ThreadCatalogCache));
+    } catch {
+        // Cached discovery data is optional when browser storage is full.
+    }
+}
+
 function isImageAttachment(item: AgentAttachment) {
     return item.kind === "image" || (!item.kind && item.type?.startsWith("image/"));
 }
@@ -556,7 +585,9 @@ export function CodexRemoteConsole() {
     useEffect(() => {
         const loadedSettings = sanitizeSettings(readJson<Partial<Settings>>(localStorage.getItem(settingsKey), {}));
         const storedProjects = localStorage.getItem(projectsKey);
-        const initialProjects = storedProjects === null ? projectPresets : normalizeProjectList(readJson<ProjectPreset[]>(storedProjects, []));
+        const cachedCatalog = readThreadCatalog();
+        const savedProjects = storedProjects === null ? projectPresets : normalizeProjectList(readJson<ProjectPreset[]>(storedProjects, []));
+        const initialProjects = mergeProjectLists(savedProjects, cachedCatalog.projects);
         const savedProjectId = localStorage.getItem(activeProjectKey) || "";
         const matchedProject = findProjectPreset(initialProjects, loadedSettings);
         const savedProject = initialProjects.find((project) => project.id === savedProjectId) || null;
@@ -573,8 +604,9 @@ export function CodexRemoteConsole() {
         settingsRef.current = initialSettings;
         setSettings(initialSettings);
         setProjects(initialProjects);
+        setThreads(cachedCatalog.threads);
         setActiveProjectId(initialProject?.id || "");
-        setMessages(readStoredMessages(normalizeCanvasId(initialSettings.canvasId)));
+        setMessages(readStoredThreadMessages(initialSettings.threadId) || readStoredMessages(normalizeCanvasId(initialSettings.canvasId)));
         setQueuedTasks(normalizeQueue(readJson<QueuedTask[]>(localStorage.getItem(queueKey), [])));
         setPendingGuides(normalizePendingGuides(readJson<PendingGuide | PendingGuide[] | null>(localStorage.getItem(pendingGuideKey), null)));
         setQuotaUnlocked(codexRemoteDemoMode && localStorage.getItem(quotaUnlockKey) === "1");
@@ -651,14 +683,20 @@ export function CodexRemoteConsole() {
         if (!hydrated) return;
         atBottomRef.current = true;
         setUnreadCount(0);
-        setMessages(readStoredMessages(normalizeCanvasId(settings.canvasId)));
+        setMessages(readStoredThreadMessages(settings.threadId) || readStoredMessages(normalizeCanvasId(settings.canvasId)));
     }, [hydrated, settings.canvasId]);
 
     useEffect(() => {
         if (!hydrated) return;
         const storedMessages = JSON.stringify(messages.slice(-120));
-        localStorage.setItem(messagesStorageKey(normalizeCanvasId(settingsRef.current.canvasId)), storedMessages);
-        localStorage.setItem(messagesKey, storedMessages);
+        try {
+            localStorage.setItem(messagesStorageKey(normalizeCanvasId(settingsRef.current.canvasId)), storedMessages);
+            localStorage.setItem(messagesKey, storedMessages);
+            const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
+            if (threadId) localStorage.setItem(threadMessagesStorageKey(threadId), storedMessages);
+        } catch {
+            // Message caches are best effort and must not interrupt the active chat.
+        }
         const scroller = scrollerRef.current;
         if (!scroller) return;
         if (atBottomRef.current) {
@@ -1150,7 +1188,7 @@ export function CodexRemoteConsole() {
         try {
             const data = await agentFetch<{ workspace?: Workspace; messages?: MobileMessage[] }>(`/agent/codex/threads/${encodeURIComponent(threadId)}/resume`, {
                 method: "POST",
-                body: JSON.stringify(workspaceRequestBody(canvasId, codexModelSettings(settingsRef.current))),
+                body: JSON.stringify(workspaceRequestBody(canvasId, { workspacePath: settingsRef.current.workspacePath.trim() || undefined, ...codexModelSettings(settingsRef.current) })),
             });
             if (syncSeq !== threadSyncSeqRef.current) return false;
             setWorkspace(data.workspace || workspace);
@@ -1177,14 +1215,16 @@ export function CodexRemoteConsole() {
         setThreadsLoading(true);
         setThreadError("");
         try {
-            const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
-            const query = workspaceSearchParams(canvasId);
+            const query = new URLSearchParams();
             if (threadSearch.trim()) query.set("searchTerm", threadSearch.trim());
-            const data = await agentFetch<{ workspace?: Workspace; data?: ThreadSummary[] }>(`/agent/codex/threads?${query.toString()}`);
+            const data = await agentFetch<{ projects?: ProjectPreset[]; data?: ThreadSummary[] }>(`/agent/codex/workspaces?${query.toString()}`);
+            const discoveredProjects = normalizeProjectList(data.projects || []);
             const nextThreads = data.data || [];
-            setThreads((items) => mergeThreadLists(items, nextThreads));
-            if (data.workspace) setWorkspace(data.workspace);
-            if (!quiet) pushMessage({ id: createId(), role: "status", text: nextThreads.length ? `已读取 ${nextThreads.length} 个当前工作区会话。` : "当前工作区没有可显示的 Codex 会话。" });
+            const mergedProjects = mergeProjectLists(discoveredProjects, projects);
+            setThreads(nextThreads);
+            setProjects(mergedProjects);
+            if (!threadSearch.trim()) writeThreadCatalog(nextThreads, mergedProjects);
+            if (!quiet) pushMessage({ id: createId(), role: "status", text: nextThreads.length ? `已读取 ${nextThreads.length} 个全部工作区会话。` : "电脑上没有可显示的 Codex 会话。" });
             return nextThreads;
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
@@ -1216,9 +1256,10 @@ export function CodexRemoteConsole() {
             const data = await agentFetch<{ projects?: ProjectPreset[]; data?: ThreadSummary[] }>(`/agent/codex/workspaces?${query.toString()}`);
             const discoveredProjects = normalizeProjectList(data.projects || []);
             const discoveredThreads = data.data || [];
-            const mergedProjects = mergeProjectLists(projects, discoveredProjects);
+            const mergedProjects = mergeProjectLists(discoveredProjects, projects);
             setThreads(discoveredThreads);
             setProjects(mergedProjects);
+            if (!threadSearch.trim()) writeThreadCatalog(discoveredThreads, mergedProjects);
             if (!quiet) pushMessage({ id: createId(), role: "status", text: discoveredProjects.length ? `已从电脑发现 ${discoveredProjects.length} 个 Codex 工作区。` : "没有发现新的 Codex 工作区。" });
             return mergedProjects;
         } catch (error) {
@@ -1523,26 +1564,34 @@ export function CodexRemoteConsole() {
         setActiveThreadId(project.threadId);
         setThreadSearch("");
         setThreadError("");
-        setThreads([]);
-        setMessages(readStoredMessages(project.canvasId));
+        setMessages(readStoredThreadMessages(project.threadId) || readStoredMessages(project.canvasId));
         setConnectionMessage(`已选择 ${project.label}，工作区：${project.workspacePath}`);
+        setThreadsOpen(false);
 
         if (!nextSettings.agentUrl.trim() || !nextSettings.token.trim()) {
             setConnectionStatus("idle");
             return;
         }
 
-        threadSyncSeqRef.current += 1;
+        if (project.threadId) {
+            setTemporaryStatus(`已切换到 ${project.label}，正在同步会话...`);
+            await syncThreadInBackground(project.threadId, normalizeCanvasId(project.canvasId), { forceScroll: true, clearWhenEmpty: true, statusText: `已切换到 ${project.label}` });
+            return;
+        }
+
         setTemporaryStatus(`正在切换到 ${project.label}...`);
-        const ok = await connect({ quiet: true });
-        if (ok) {
-            setThreadsOpen(false);
-            setTemporaryStatus(project.threadId ? `已切换到 ${project.label}，正在同步会话...` : `已切换到 ${project.label}`, !project.threadId);
-            if (project.threadId) void syncThreadInBackground(project.threadId, normalizeCanvasId(project.canvasId), { forceScroll: true, statusText: `已切换到 ${project.label}` });
-            void refreshThreads(true);
-            void refreshGitRepos(true);
-        } else {
+        try {
+            const data = await agentFetch<{ workspace?: Workspace }>("/agent/codex/workspace", {
+                method: "POST",
+                body: JSON.stringify(workspaceRequestBody(project.canvasId, { workspacePath: project.workspacePath, ...codexModelSettings(nextSettings) })),
+            });
+            if (data.workspace) setWorkspace(data.workspace);
+            setConnected(true);
+            setConnectionStatus("connected");
+            setTemporaryStatus(`已切换到 ${project.label}`, true);
+        } catch (error) {
             setTemporaryStatus("");
+            pushMessage({ id: createId(), role: "error", title: "项目切换失败", text: error instanceof Error ? error.message : String(error) });
         }
     };
 
@@ -1637,6 +1686,7 @@ export function CodexRemoteConsole() {
         settingsRef.current = { ...settingsRef.current, threadId: thread.id };
         setActiveThreadId(thread.id);
         updateSettings({ threadId: thread.id });
+        setMessages(readStoredThreadMessages(thread.id) || readStoredMessages(canvasId));
         setThreadsOpen(false);
         setTemporaryStatus("已切换会话，正在同步记录...");
         void syncThreadInBackground(thread.id, canvasId, { forceScroll: true, clearWhenEmpty: true, statusText: "会话已同步" });
@@ -2199,7 +2249,7 @@ export function CodexRemoteConsole() {
                                 </div>
                             </div>
                             <div className="mt-4 flex gap-2">
-                                <input value={threadSearch} onChange={(event) => setThreadSearch(event.target.value)} placeholder="搜索当前项目会话" className="h-11 min-w-0 flex-1 rounded-xl border border-black/10 bg-white px-3 text-stone-950 outline-none placeholder:text-stone-400 focus:border-stone-500 dark:border-white/10 dark:bg-[#181818] dark:text-stone-100" />
+                                <input value={threadSearch} onChange={(event) => setThreadSearch(event.target.value)} placeholder="搜索项目与会话" className="h-11 min-w-0 flex-1 rounded-xl border border-black/10 bg-white px-3 text-stone-950 outline-none placeholder:text-stone-400 focus:border-stone-500 dark:border-white/10 dark:bg-[#181818] dark:text-stone-100" />
                                 <button type="button" className="grid size-11 place-items-center rounded-xl border border-black/10 bg-white text-stone-600 disabled:opacity-45 dark:border-white/10 dark:bg-[#181818] dark:text-stone-300" onClick={() => void refreshThreads()} disabled={threadsLoading || !settings.agentUrl.trim() || !settings.token.trim()} aria-label="刷新会话">
                                     <RefreshCcw className={`size-4 ${threadsLoading ? "animate-spin" : ""}`} />
                                 </button>

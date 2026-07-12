@@ -9,10 +9,12 @@ const tempRoot = path.join(root, ".tmp");
 const tempHome = path.join(tempRoot, "bridge-smoke-home");
 const port = 17479;
 const env = { ...process.env, USERPROFILE: tempHome, HOME: tempHome };
+const fakeThreadId = "11111111-1111-1111-1111-111111111111";
 
 if (!tempHome.startsWith(`${tempRoot}${path.sep}`)) throw new Error("Unsafe smoke-test temp path.");
 await fs.rm(tempHome, { recursive: true, force: true });
 await fs.mkdir(tempHome, { recursive: true });
+await writeFakeSession();
 
 const entry = path.join(root, "packages", "bridge", "dist", "index.js");
 await testAttachments();
@@ -54,7 +56,19 @@ try {
   });
   assert(authorized.status === 200, `Authorized workspace request failed (${authorized.status}).`);
   assert(authorized.headers.get("access-control-allow-origin") === "https://console.example.com", "Allowed CORS origin was not returned.");
-  console.log("Bridge smoke test passed: attachments, SSE replay, setup, fixed URL, auth, workspace and CORS.");
+  const fastHistory = await fetch(`http://127.0.0.1:${port}/agent/codex/threads/${fakeThreadId}/resume`, {
+    method: "POST",
+    headers: {
+      Origin: "https://console.example.com",
+      "Content-Type": "application/json",
+      "x-codex-remote-token": stored.token,
+    },
+    body: JSON.stringify({ workspaceId: "default", workspacePath: root }),
+  }).then((response) => response.json());
+  assert(fastHistory.fastHistory === true, "Bridge did not use the fast local session history.");
+  assert(fastHistory.messages?.some((message) => message.role === "user" && message.text === "Fast history request"), "Fast history omitted the user message.");
+  assert(fastHistory.messages?.some((message) => message.role === "assistant" && message.text === "Fast history response"), "Fast history omitted the assistant response.");
+  console.log("Bridge smoke test passed: attachments, fast history, SSE replay, setup, fixed URL, auth, workspace and CORS.");
 } finally {
   child.kill();
   await new Promise((resolve) => child.once("exit", resolve));
@@ -166,4 +180,18 @@ async function testEventReplay() {
   assert(replay.includes('"sequence":2'), "SSE replay did not restore the event missed during reconnect.");
   assert(resumed.headers["Cache-Control"] === "no-cache, no-transform", "SSE response did not disable proxy transformation.");
   resumed.close();
+}
+
+async function writeFakeSession() {
+  const sessionDir = path.join(tempHome, ".codex", "sessions", "2026", "07", "12");
+  await fs.mkdir(sessionDir, { recursive: true });
+  const rows = [
+    { timestamp: "2026-07-12T00:00:00.000Z", type: "session_meta", payload: { id: fakeThreadId, session_id: fakeThreadId, cwd: root } },
+    { timestamp: "2026-07-12T00:00:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn-fast" } },
+    { timestamp: "2026-07-12T00:00:02.000Z", type: "event_msg", payload: { type: "user_message", message: "Fast history request" } },
+    { timestamp: "2026-07-12T00:00:03.000Z", type: "response_item", payload: { type: "function_call", id: "tool-fast", name: "exec_command", arguments: JSON.stringify({ cmd: "npm test" }) } },
+    { timestamp: "2026-07-12T00:00:04.000Z", type: "event_msg", payload: { type: "agent_message", phase: "final_answer", message: "Fast history response" } },
+    { timestamp: "2026-07-12T00:00:05.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn-fast" } },
+  ];
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-07-12T00-00-00-${fakeThreadId}.jsonl`), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
 }

@@ -22,12 +22,32 @@ type AgentHistoryMessage = {
   detail?: unknown;
   streamId?: string;
 };
+type ThreadListResult = {
+  data: ReturnType<typeof summarizeCodexThread>[];
+  nextCursor: unknown;
+  backwardsCursor: unknown;
+};
 
 let codexQueue: Promise<unknown> = Promise.resolve();
 let codexApp: CodexAppClient | null = null;
 let codexAppStart: Promise<CodexAppClient> | null = null;
 let codexThreadId = "";
+let threadListGeneration = 0;
+const threadListCache = new Map<string, { expiresAt: number; value: ThreadListResult }>();
+const threadListInFlight = new Map<string, Promise<ThreadListResult>>();
+const THREAD_LIST_CACHE_MS = 10_000;
+const CODEX_SESSION_TAIL_BYTES = 8 * 1024 * 1024;
+const CODEX_SESSION_HEAD_BYTES = 1024 * 1024;
+const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
+const fastThreadCache = new Map<string, { size: number; mtimeMs: number; value: Awaited<ReturnType<typeof readSessionThreadNow>> }>();
+let sessionFileIndex: { expiresAt: number; files: Map<string, string> } | null = null;
 const require = createRequire(import.meta.url);
+
+function invalidateThreadListCache() {
+  threadListGeneration += 1;
+  threadListCache.clear();
+  threadListInFlight.clear();
+}
 
 function getCodexApp(emit: AgentEmit) {
   if (codexApp) return Promise.resolve(codexApp);
@@ -76,6 +96,7 @@ export async function steerCodexTurn(
       cleanupDeferred = true;
     }
   } finally {
+    invalidateThreadListCache();
     if (!cleanupDeferred) await cleanupPreparedAttachments(prepared);
   }
 }
@@ -106,6 +127,7 @@ async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: Age
   } catch (error) {
     emit("agent_error", { message: errorMessage(error) });
   } finally {
+    invalidateThreadListCache();
     if (!cleanupDeferred) await cleanupPreparedAttachments(prepared);
   }
 }
@@ -114,6 +136,7 @@ export async function startCodexThread(emit: AgentEmit, cwd?: string, options: C
   const app = await getCodexApp(emit);
   const thread = await app.startThread(cwd, options);
   codexThreadId = String(field(thread, "id") || "");
+  invalidateThreadListCache();
   return thread;
 }
 
@@ -135,25 +158,42 @@ export async function listCodexThreads(
   emit: AgentEmit,
   options: { cwd?: string; searchTerm?: string; limit?: number },
 ) {
-  const app = await getCodexApp(emit);
-  const result = await app.listThreads({
-    limit: options.limit || 40,
-    sortKey: "updated_at",
-    sortDirection: "desc",
-    sourceKinds: ["cli", "vscode", "appServer", "exec"],
-    ...(options.cwd ? { cwd: options.cwd } : {}),
-    ...(options.searchTerm ? { searchTerm: options.searchTerm } : {}),
-  });
-  const data = Array.isArray(field(result, "data"))
-    ? (field(result, "data") as unknown[])
-        .map(summarizeCodexThread)
-        .filter((thread) => !options.cwd || threadInWorkspace(thread, options.cwd))
-    : [];
-  return {
-    data,
-    nextCursor: field(result, "nextCursor") || null,
-    backwardsCursor: field(result, "backwardsCursor") || null,
-  };
+  const key = JSON.stringify({ cwd: options.cwd || "", searchTerm: options.searchTerm || "", limit: options.limit || 40 });
+  const cached = threadListCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  const existing = threadListInFlight.get(key);
+  if (existing) return existing;
+
+  const generation = threadListGeneration;
+  const request = (async () => {
+    const app = await getCodexApp(emit);
+    const result = await app.listThreads({
+      limit: options.limit || 40,
+      sortKey: "updated_at",
+      sortDirection: "desc",
+      sourceKinds: ["cli", "vscode", "appServer", "exec"],
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.searchTerm ? { searchTerm: options.searchTerm } : {}),
+    });
+    const data = Array.isArray(field(result, "data"))
+      ? (field(result, "data") as unknown[])
+          .map(summarizeCodexThread)
+          .filter((thread) => !options.cwd || threadInWorkspace(thread, options.cwd))
+      : [];
+    const value = {
+      data,
+      nextCursor: field(result, "nextCursor") || null,
+      backwardsCursor: field(result, "backwardsCursor") || null,
+    };
+    if (generation === threadListGeneration) threadListCache.set(key, { expiresAt: Date.now() + THREAD_LIST_CACHE_MS, value });
+    return value;
+  })();
+  threadListInFlight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (threadListInFlight.get(key) === request) threadListInFlight.delete(key);
+  }
 }
 
 export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: string) {
@@ -168,6 +208,31 @@ export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: s
   };
 }
 
+export async function readCodexThreadFast(emit: AgentEmit, threadId: string, cwd?: string) {
+  try {
+    const sessionFile = await findSessionFile(threadId);
+    if (!sessionFile) return await readCodexThread(emit, threadId, cwd);
+    const stat = await fs.stat(sessionFile);
+    const cached = fastThreadCache.get(threadId);
+    const value = cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs
+      ? cached.value
+      : await readSessionThreadNow(sessionFile, threadId, stat);
+    fastThreadCache.set(threadId, { size: stat.size, mtimeMs: stat.mtimeMs, value });
+    if (fastThreadCache.size > 24) fastThreadCache.delete(fastThreadCache.keys().next().value || "");
+    assertThreadWorkspace(value.thread, cwd);
+    const activeTurnId = codexApp?.activeTurnId(threadId) || value.activeTurnId;
+    return {
+      ...value,
+      thread: { ...value.thread, status: activeTurnId ? "running" : value.thread.status },
+      busy: Boolean(activeTurnId),
+      activeTurnId,
+      fastHistory: true,
+    };
+  } catch {
+    return await readCodexThread(emit, threadId, cwd);
+  }
+}
+
 export async function verifyCodexThreadWorkspace(emit: AgentEmit, threadId: string, cwd: string) {
   await loadCodexThread(emit, threadId, cwd, false);
 }
@@ -176,6 +241,7 @@ export async function archiveCodexThread(emit: AgentEmit, threadId: string, cwd?
   const app = await getCodexApp(emit);
   await loadCodexThread(emit, threadId, cwd, false);
   await app.archiveThread(threadId);
+  invalidateThreadListCache();
 }
 
 async function ensureCodexThread(app: CodexAppClient, options: CodexRunOptions) {
@@ -475,6 +541,180 @@ function normalizeCodexNotification(method: string, params: Json): AgentEvent | 
   if (method === "item/completed") return { type: "item.completed", item: normalizeItem(field(params, "item")) };
   if (method === "error") return { type: "error", message: field(params, "message") };
   return null;
+}
+
+async function findSessionFile(threadId: string) {
+  if (!/^[a-zA-Z0-9-]{8,128}$/.test(threadId)) return "";
+  if (!sessionFileIndex || sessionFileIndex.expiresAt <= Date.now()) {
+    const files = new Map<string, string>();
+    await indexSessionFiles(CODEX_SESSIONS_DIR, files);
+    sessionFileIndex = { expiresAt: Date.now() + 30_000, files };
+  }
+  return sessionFileIndex.files.get(threadId) || "";
+}
+
+async function indexSessionFiles(directory: string, files: Map<string, string>) {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(directory, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const filePath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await indexSessionFiles(filePath, files);
+      continue;
+    }
+    const match = entry.name.match(/([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$/i);
+    if (!match) continue;
+    const previous = files.get(match[1]);
+    if (!previous || filePath.localeCompare(previous) > 0) files.set(match[1], filePath);
+  }
+}
+
+async function readSessionThreadNow(sessionFile: string, threadId: string, stat: { size: number; mtimeMs: number; birthtimeMs: number }) {
+  const tailStart = Math.max(0, stat.size - CODEX_SESSION_TAIL_BYTES);
+  const tailBuffer = await readFileSlice(sessionFile, tailStart, stat.size - tailStart);
+  let tailText = tailBuffer.toString("utf8");
+  if (tailStart > 0) tailText = tailText.slice(Math.max(0, tailText.indexOf("\n") + 1));
+  const tailRows = parseSessionRows(tailText);
+  let metadata = [...tailRows].reverse().find((row) => row.type === "session_meta");
+  if (!metadata) {
+    const headBuffer = await readFileSlice(sessionFile, 0, Math.min(stat.size, CODEX_SESSION_HEAD_BYTES));
+    metadata = parseSessionRows(headBuffer.toString("utf8")).find((row) => row.type === "session_meta");
+  }
+
+  const messages: AgentHistoryMessage[] = [];
+  let activeTurnId = "";
+  for (let index = 0; index < tailRows.length; index += 1) {
+    const row = tailRows[index];
+    const payload = field(row, "payload") as Json | undefined;
+    const rowType = String(field(row, "type") || "");
+    const payloadType = String(field(payload, "type") || "");
+    const sourceId = String(field(payload, "id") || field(payload, "call_id") || "event");
+    const id = `session-${index}-${sourceId}`;
+
+    if (rowType === "event_msg" && payloadType === "task_started") {
+      activeTurnId = String(field(payload, "turn_id") || id);
+      continue;
+    }
+    if (rowType === "event_msg" && (payloadType === "task_complete" || payloadType === "turn_aborted")) {
+      const completedTurnId = String(field(payload, "turn_id") || "");
+      if (!completedTurnId || !activeTurnId || completedTurnId === activeTurnId) activeTurnId = "";
+      continue;
+    }
+    if (rowType === "event_msg" && payloadType === "thread_rolled_back") {
+      removeRecentTurns(messages, Number(field(payload, "num_turns") || 0));
+      continue;
+    }
+    if (rowType === "event_msg" && payloadType === "user_message") {
+      const text = String(field(payload, "message") || "").trim();
+      if (text) messages.push({ id, role: "user", text });
+      continue;
+    }
+    if (rowType === "event_msg" && payloadType === "agent_message") {
+      const text = String(field(payload, "message") || "").trim();
+      if (text) messages.push({ id, streamId: id, role: "assistant", title: "Codex", text });
+      continue;
+    }
+    const tool = sessionToolMessage(rowType, payloadType, payload, id);
+    if (tool) messages.push(tool);
+  }
+
+  const metaPayload = field(metadata, "payload") as Json | undefined;
+  const cwd = String(field(metaPayload, "cwd") || "");
+  return {
+    thread: {
+      id: threadId,
+      sessionId: String(field(metaPayload, "session_id") || field(metaPayload, "id") || threadId),
+      cwd,
+      status: activeTurnId ? "running" : "completed",
+      createdAt: stat.birthtimeMs,
+      updatedAt: stat.mtimeMs,
+    },
+    messages: limitSessionMessages(messages.filter((message) => message.text)),
+    activeTurnId,
+  };
+}
+
+async function readFileSlice(filePath: string, position: number, length: number) {
+  const handle = await fs.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(Math.max(0, length));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await handle.close();
+  }
+}
+
+function parseSessionRows(text: string) {
+  const rows: Json[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    try {
+      rows.push(JSON.parse(line) as Json);
+    } catch {
+      // The first or last line of a byte range can be incomplete.
+    }
+  }
+  return rows;
+}
+
+function sessionToolMessage(rowType: string, payloadType: string, payload: Json | undefined, id: string): AgentHistoryMessage | null {
+  if (rowType === "response_item" && payloadType === "function_call") {
+    const name = String(field(payload, "name") || "Command");
+    const args = parseMaybeJson(field(payload, "arguments"));
+    const command = field(args, "cmd") || field(args, "command");
+    return { id, role: "tool", title: name === "exec_command" ? "Command" : name, text: limitedToolText(command || `${name} completed`) };
+  }
+  if (rowType === "response_item" && payloadType === "custom_tool_call") {
+    const name = String(field(payload, "name") || "Tool call");
+    return { id, role: "tool", title: name === "apply_patch" ? "File change" : name, text: `${name} ${String(field(payload, "status") || "completed")}` };
+  }
+  if (rowType === "response_item" && payloadType === "tool_search_call") {
+    return { id, role: "tool", title: "Tool search", text: limitedToolText(field(payload, "arguments") || "Tool search completed") };
+  }
+  if (rowType === "event_msg" && payloadType === "mcp_tool_call_end") {
+    const invocation = field(payload, "invocation") as Json | undefined;
+    const name = String(field(invocation, "tool") || field(invocation, "name") || "MCP tool");
+    return { id, role: "tool", title: name, text: `${name} completed` };
+  }
+  return null;
+}
+
+function limitedToolText(value: unknown) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  return String(text || "completed").slice(0, 4000);
+}
+
+function removeRecentTurns(messages: AgentHistoryMessage[], count: number) {
+  for (let turn = 0; turn < count; turn += 1) {
+    let userIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role === "user") {
+        userIndex = index;
+        break;
+      }
+    }
+    if (userIndex < 0) return;
+    messages.splice(userIndex);
+  }
+}
+
+function limitSessionMessages(messages: AgentHistoryMessage[]) {
+  if (messages.length <= 120) return messages;
+  const limited = messages.slice(-119);
+  let latestUser: AgentHistoryMessage | null = null;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "user") {
+      latestUser = messages[index];
+      break;
+    }
+  }
+  if (!latestUser || limited.some((message) => message.id === latestUser?.id)) return messages.slice(-120);
+  return [latestUser, ...limited];
 }
 
 async function loadCodexThread(emit: AgentEmit, threadId: string, cwd: string | undefined, includeTurns: boolean) {
