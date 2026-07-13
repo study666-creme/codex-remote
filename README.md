@@ -31,7 +31,7 @@ Connect token: <本机随机令牌>
 
 ### 1. 手机实时控制 Codex
 
-在手机上发任务、查看 Codex 文本和工具事件，并通过 SSE 接收流式状态。任务运行期间发送的新要求会走 `turn/steer`，直接引导当前任务。
+在手机上发任务、查看 Codex 文本和工具事件，并通过 SSE 接收流式状态。任务运行期间发送的新要求会走 `turn/steer`，直接引导当前任务。切换到其他会话后，原任务会继续在电脑上运行，但它的事件不会串入当前页面；返回原会话时再读取最新记录。
 
 <img src="apps/web/public/screenshots/02-mobile-chat.png" alt="Codex 手机实时对话页" width="390" />
 
@@ -175,7 +175,7 @@ npm run screenshots -w @codex-remote/web
 
 ## 安全
 
-Bridge 能让远端请求在所选工作区中运行 Codex，并使用本机 Git 凭据推送代码。不要把 `17372` 端口直接暴露到公网；必须使用 HTTPS、长随机令牌和受控来源。详见 [安全说明](docs/security.md)。
+Bridge 能让远端请求运行 Codex，并使用本机 SSH 与 Git 凭据。为保持和电脑端一致的部署能力，默认 Codex 沙箱为 `danger-full-access`；需要限制到项目目录时设置 `CODEX_REMOTE_SANDBOX=workspace-write`。不要把 `17372` 端口直接暴露到公网；必须使用 HTTPS、长随机令牌和受控来源。详见 [安全说明](docs/security.md)。
 
 ## 开源许可
 

@@ -68,6 +68,7 @@ const repos = [
 
 const server = await preview({
   root,
+  configLoader: "runner",
   preview: { host: "127.0.0.1", port: 4173, strictPort: true },
 });
 
@@ -90,6 +91,13 @@ try {
     });
 
     await page.addInitScript(({ initialSettings, initialProjects, initialMessages, initialQueue, initialGuides, initialBusy, initialPendingPrompt }) => {
+      window.EventSource = new Proxy(window.EventSource, {
+        construct(Target, args) {
+          const source = new Target(...args);
+          window.__codexRemoteEventSource = source;
+          return source;
+        },
+      });
       localStorage.setItem("infinite-canvas:theme_store", JSON.stringify({ state: { theme: "dark" } }));
       localStorage.setItem("codex-remote-mobile:settings", JSON.stringify(initialSettings));
       localStorage.setItem("codex-remote-mobile:projects", JSON.stringify(initialProjects));
@@ -206,6 +214,42 @@ try {
   if (switchedSettings.threadId !== "thread-a2") throw new Error("Conversation switch did not persist the selected thread");
   await page.close();
   console.log("Verified full catalog refresh and one-request conversation switching");
+
+  let activeConversation = "thread-a";
+  page = await createPage({
+    agentHandler: async ({ request, url, headers }) => {
+      if (url.pathname === "/agent/codex/threads/thread-a2/resume") {
+        activeConversation = "thread-a2";
+        return { status: 200, headers, json: { ok: true, workspace: { ...workspace, activeThreadId: "thread-a2" }, messages: [{ id: "a2-user", role: "user", text: "分析商品列表性能" }] } };
+      }
+      return null;
+    },
+  });
+  await page.getByRole("button", { name: "连接", exact: true }).click();
+  await page.waitForFunction(() => Boolean(window.__codexRemoteEventSource));
+  await page.getByRole("button", { name: "打开侧边栏" }).click();
+  await page.getByText("商品列表性能", { exact: true }).click();
+  await page.getByText("分析商品列表性能", { exact: true }).waitFor();
+  await page.evaluate(() => {
+    const source = window.__codexRemoteEventSource;
+    source?.dispatchEvent(new MessageEvent("agent_event", { data: JSON.stringify({ type: "item.updated", thread_id: "thread-a", item: { id: "old-reply", type: "agent_message", text: "旧会话回复不应出现在这里" } }) }));
+    source?.dispatchEvent(new MessageEvent("agent_done", { data: JSON.stringify({ thread_id: "thread-a" }) }));
+  });
+  await page.waitForTimeout(100);
+  if (await page.getByText("旧会话回复不应出现在这里", { exact: true }).count()) throw new Error("Background thread event leaked into the selected conversation");
+  if (activeConversation !== "thread-a2") throw new Error("Conversation switch did not remain on the selected thread");
+  await page.evaluate(() => {
+    const source = window.__codexRemoteEventSource;
+    source?.dispatchEvent(new MessageEvent("agent_event", { data: JSON.stringify({ type: "turn.started", thread_id: "thread-a2", turn_id: "turn-a2" }) }));
+  });
+  await page.getByText("Codex 正在思考...", { exact: true }).first().waitFor();
+  await page.evaluate(() => {
+    const source = window.__codexRemoteEventSource;
+    source?.dispatchEvent(new MessageEvent("agent_event", { data: JSON.stringify({ type: "turn.completed", thread_id: "thread-a2", turn_id: "turn-a2" }) }));
+  });
+  await page.waitForFunction(() => document.querySelectorAll(".animate-spin").length === 0);
+  await page.close();
+  console.log("Verified background thread isolation and automatic completion state");
 
   page = await createPage();
   await page.getByRole("button", { name: "打开侧边栏" }).click();

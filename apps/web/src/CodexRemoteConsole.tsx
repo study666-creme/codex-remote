@@ -8,7 +8,7 @@ type MobileMessage = { id: string; role: MessageRole; title?: string; text: stri
 type ReceiveMode = "full" | "text" | "final";
 type Settings = { agentUrl: string; token: string; canvasId: string; threadId: string; workspacePath: string; gitRepoPath: string; model: string; effort: string; receiveMode: ReceiveMode };
 type Workspace = { canvasId: string; workspaceId?: string; workspacePath: string; activeThreadId?: string; model?: string; effort?: string };
-type AgentEvent = { type?: string; item?: Record<string, unknown>; usage?: unknown; message?: string };
+type AgentEvent = { type?: string; item?: Record<string, unknown>; usage?: unknown; message?: string; thread_id?: string; turn_id?: string };
 type PendingRun = { threadId: string; canvasId: string; prompt: string; startedAt: number };
 type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 type GitRemoteInfo = { name: string; url: string };
@@ -534,18 +534,11 @@ export function CodexRemoteConsole() {
     const [unlockError, setUnlockError] = useState("");
     const [demoNoticeOpen, setDemoNoticeOpen] = useState(false);
     const [runStatus, setRunStatus] = useState("");
-    const [syncPaused, setSyncPaused] = useState(false);
     const [unreadCount, setUnreadCount] = useState(0);
     const eventSourceRef = useRef<EventSource | null>(null);
     const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const completionFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const autoSyncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-    const autoSyncInFlightRef = useRef(false);
-    const autoSyncFailureCountRef = useRef(0);
-    const lastAutoSyncAtRef = useRef(0);
     const pollingRunKeyRef = useRef("");
-    const syncPausedRef = useRef(false);
     const pendingPromptRef = useRef("");
     const activeQueueTaskIdRef = useRef("");
     const queuedTasksRef = useRef<QueuedTask[]>([]);
@@ -615,8 +608,6 @@ export function CodexRemoteConsole() {
             eventSourceRef.current?.close();
             stopThreadPoll();
             if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
-            if (completionFallbackTimerRef.current) clearTimeout(completionFallbackTimerRef.current);
-            if (autoSyncTimerRef.current) clearInterval(autoSyncTimerRef.current);
         };
     }, []);
 
@@ -709,26 +700,34 @@ export function CodexRemoteConsole() {
 
     useEffect(() => {
         if (!hydrated) return;
-        const resume = (force = false) => {
+        const pendingRun = readPendingRun(normalizeCanvasId(settings.canvasId));
+        if (pendingRun?.threadId === (activeThreadIdRef.current || normalizeThreadId(settings.threadId))) {
+            pendingPromptRef.current = pendingRun.prompt;
+            setSending(true);
+            setTemporaryStatus("Codex 正在执行...");
+            if (!eventSourceRef.current || eventSourceRef.current.readyState === EventSource.CLOSED) pollThreadUntilReply(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
+        }
+        try {
+            ensureRealtimeEvents(validateAgentUrl(settingsRef.current.agentUrl), { silent: true });
+        } catch {
+            // Connection settings may still be incomplete; the explicit connect button will show the error.
+        }
+        const syncVisibleThread = () => {
             if (document.visibilityState === "hidden") return;
-            if (syncPausedRef.current) return;
-            void autoSyncFromAgent(force ? "foreground" : "interval");
+            const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
+            if (!threadId || !settingsRef.current.agentUrl.trim() || !settingsRef.current.token.trim()) return;
+            void refreshThreadMessages(threadId, normalizeCanvasId(settingsRef.current.canvasId)).catch(() => undefined);
         };
-        const handleFocus = () => resume(true);
-        const handleVisibility = () => resume(true);
-        window.addEventListener("focus", handleFocus);
-        window.addEventListener("online", handleFocus);
+        const handleVisibility = () => syncVisibleThread();
+        window.addEventListener("focus", syncVisibleThread);
+        window.addEventListener("online", syncVisibleThread);
         document.addEventListener("visibilitychange", handleVisibility);
-        resume(true);
-        autoSyncTimerRef.current = setInterval(() => resume(false), codexBusy || runStatus ? 10000 : 30000);
         return () => {
-            window.removeEventListener("focus", handleFocus);
-            window.removeEventListener("online", handleFocus);
+            window.removeEventListener("focus", syncVisibleThread);
+            window.removeEventListener("online", syncVisibleThread);
             document.removeEventListener("visibilitychange", handleVisibility);
-            if (autoSyncTimerRef.current) clearInterval(autoSyncTimerRef.current);
-            autoSyncTimerRef.current = null;
         };
-    }, [hydrated, activeThreadId, settings.agentUrl, settings.token, settings.canvasId, settings.threadId, codexBusy, runStatus, syncPaused]);
+    }, [hydrated, activeThreadId, settings.agentUrl, settings.token, settings.canvasId, settings.threadId]);
 
     const setTemporaryStatus = (text: string, autoClear = false) => {
         setRunStatus(text);
@@ -773,45 +772,24 @@ export function CodexRemoteConsole() {
         pollingRunKeyRef.current = "";
     }
 
-    function stopCompletionFallback() {
-        if (!completionFallbackTimerRef.current) return;
-        clearTimeout(completionFallbackTimerRef.current);
-        completionFallbackTimerRef.current = null;
-    }
-
-    function setSyncPause(paused: boolean) {
-        syncPausedRef.current = paused;
-        setSyncPaused(paused);
-    }
-
-    function stopBackgroundSync(message = "已停止手机端后台同步。") {
-        setSyncPause(true);
-        autoSyncFailureCountRef.current = 0;
+    function stopCurrentFollow(message = "已停止关注当前任务，电脑上的 Codex 会继续运行。") {
         pendingPromptRef.current = "";
         threadSyncSeqRef.current += 1;
         setSending(false);
         setRemoteBusy(false);
         clearPendingRun();
         stopThreadPoll();
-        stopCompletionFallback();
-        eventSourceRef.current?.close();
-        eventSourceRef.current = null;
-        setConnected(false);
-        setConnecting(false);
-        setConnectionStatus("idle");
         setConnectionMessage(message);
         setTemporaryStatus("");
         markActiveQueueTask("failed", message);
     }
 
     function finishCurrentTurn(statusText = "本轮完成", autoClear = true) {
-        setSyncPause(false);
         pendingPromptRef.current = "";
         setSending(false);
         setRemoteBusy(false);
         clearPendingRun();
         stopThreadPoll();
-        stopCompletionFallback();
         markActiveQueueTask("done");
         setTemporaryStatus(statusText, autoClear);
         window.setTimeout(() => void runNextQueuedTask(), 350);
@@ -823,7 +801,6 @@ export function CodexRemoteConsole() {
         setRemoteBusy(false);
         clearPendingRun();
         stopThreadPoll();
-        stopCompletionFallback();
         setTemporaryStatus("");
         markActiveQueueTask("failed", errorText);
         window.setTimeout(() => void runNextQueuedTask(), 350);
@@ -1090,63 +1067,6 @@ export function CodexRemoteConsole() {
         return visibleItems;
     }
 
-    function scheduleCompletionFallback() {
-        stopCompletionFallback();
-        completionFallbackTimerRef.current = setTimeout(() => {
-            const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
-            const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
-            const prompt = pendingPromptRef.current;
-            if (!threadId || !prompt) {
-                finishCurrentTurn("本轮完成", true);
-                return;
-            }
-            void refreshThreadMessages(threadId, canvasId, prompt)
-                .then(({ items, busy }) => {
-                    if (!busy && hasTurnCompletion(items, prompt)) {
-                        finishCurrentTurn("本轮完成", true);
-                        return;
-                    }
-                    setTemporaryStatus(busy ? "Codex 仍在执行，继续同步中..." : "本轮完成，正在等待最新记录...");
-                    stopThreadPoll();
-                    pollThreadUntilReply(threadId, canvasId, prompt);
-                })
-                .catch(() => {
-                    stopThreadPoll();
-                    pollThreadUntilReply(threadId, canvasId, prompt);
-                });
-        }, 1200);
-    }
-
-    async function autoSyncFromAgent(reason: "foreground" | "interval" | "offline" = "interval") {
-        const currentSettings = settingsRef.current;
-        if (syncPausedRef.current) return;
-        if (!currentSettings.agentUrl.trim() || !currentSettings.token.trim()) return;
-        if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-        if (autoSyncInFlightRef.current) return;
-        if (reason === "interval" && pollingRunKeyRef.current) return;
-        const canvasId = normalizeCanvasId(currentSettings.canvasId);
-        const pendingRun = readPendingRun(canvasId);
-        const activeWork = Boolean(pendingRun || pendingPromptRef.current || codexBusy || runStatus || connectionStatus === "offline");
-        const minInterval = reason === "foreground" ? 1500 : activeWork ? 4500 : 14000;
-        const now = Date.now();
-        if (now - lastAutoSyncAtRef.current < minInterval) return;
-        lastAutoSyncAtRef.current = now;
-        autoSyncInFlightRef.current = true;
-        try {
-            if (activeWork) setTemporaryStatus(pendingRun ? "正在自动同步后台执行结果..." : runStatus || "正在自动同步 Codex 状态...");
-            const ok = await connect({ quiet: true, silent: true, syncOnly: true });
-            if (!ok) {
-                autoSyncFailureCountRef.current += 1;
-                if (autoSyncFailureCountRef.current >= 3) stopBackgroundSync("电脑 Agent 连续 3 次不可达，已停止自动同步。电脑端任务可能仍在运行。");
-                return;
-            }
-            autoSyncFailureCountRef.current = 0;
-            await resumeThreadAfterInterruption();
-        } finally {
-            autoSyncInFlightRef.current = false;
-        }
-    }
-
     const agentFetch = async <T,>(targetPath: string, init?: RequestInit) => {
         const currentSettings = settingsRef.current;
         const mistake = agentUrlMistakeMessage(currentSettings.agentUrl);
@@ -1313,7 +1233,7 @@ export function CodexRemoteConsole() {
         let attempts = 0;
         let consecutiveFailures = 0;
         const tick = async () => {
-            if (syncPausedRef.current || pollingRunKeyRef.current !== runKey) return;
+            if (pollingRunKeyRef.current !== runKey || activeThreadIdRef.current !== threadId) return;
             attempts += 1;
             try {
                 const { items, busy } = await refreshThreadMessages(threadId, canvasId, prompt);
@@ -1325,13 +1245,13 @@ export function CodexRemoteConsole() {
             } catch (error) {
                 consecutiveFailures += 1;
                 if (consecutiveFailures >= 4) {
-                    stopBackgroundSync("电脑 Agent 连续 4 次不可达，已停止自动同步。电脑端任务可能仍在运行。");
-                    pushMessage({ id: createId(), role: "error", title: "同步已停止", text: error instanceof Error ? error.message : String(error) });
+                    stopCurrentFollow("电脑 Agent 连续 4 次不可达，已停止关注当前任务。电脑端任务可能仍在运行。");
+                    pushMessage({ id: createId(), role: "error", title: "连接已中断", text: error instanceof Error ? error.message : String(error) });
                     return;
                 }
             }
             if (attempts >= 60) {
-                stopBackgroundSync("等待 Codex 返回超时，已停止自动同步。电脑端任务可能仍在运行。");
+                stopCurrentFollow("等待 Codex 返回超时，已停止关注当前任务。电脑端任务可能仍在运行。");
                 return;
             }
             const delay = settingsRef.current.receiveMode === "final" ? 15000 : attempts < 4 ? 2500 : 5000;
@@ -1340,41 +1260,14 @@ export function CodexRemoteConsole() {
         pollTimerRef.current = setTimeout(tick, settingsRef.current.receiveMode === "final" ? 10000 : 2000);
     };
 
-    const resumeThreadAfterInterruption = async () => {
-        const currentSettings = settingsRef.current;
-        if (!currentSettings.agentUrl.trim() || !currentSettings.token.trim()) return;
-        const currentCanvasId = normalizeCanvasId(currentSettings.canvasId);
-        const pendingRun = readPendingRun(currentCanvasId);
-        if (pendingRun) {
-            pendingPromptRef.current = pendingRun.prompt;
-            setSending(true);
-            setTemporaryStatus("正在同步后台执行结果...");
-            setActiveThreadId(pendingRun.threadId);
-            if (currentSettings.threadId !== pendingRun.threadId || normalizeCanvasId(currentSettings.canvasId) !== pendingRun.canvasId) {
-                updateSettings({ threadId: pendingRun.threadId, canvasId: pendingRun.canvasId });
-            }
-            try {
-                const { items, busy } = await refreshThreadMessages(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
-                if (!busy && hasTurnCompletion(items, pendingRun.prompt)) {
-                    finishCurrentTurn("已同步最新结果", true);
-                    return;
-                }
-                pollThreadUntilReply(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
-            } catch {
-                pollThreadUntilReply(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
-            }
-            return;
-        }
-        const threadId = activeThreadIdRef.current || normalizeThreadId(currentSettings.threadId);
-        if (!threadId) return;
-        try {
-            await refreshThreadMessages(threadId, normalizeCanvasId(currentSettings.canvasId));
-        } catch {
-            // Foreground refresh is best effort; explicit connect still shows the real error.
-        }
+    const eventBelongsToVisibleThread = (event: AgentEvent) => {
+        const visibleThreadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
+        if (event.thread_id) return event.thread_id === visibleThreadId;
+        return Boolean(pendingPromptRef.current && visibleThreadId);
     };
 
     const handleAgentEvent = (event: AgentEvent) => {
+        if (!eventBelongsToVisibleThread(event)) return;
         const item = event.item;
         const itemType = normalizeText(itemField(item, "type"));
         if (event.type === "turn.started") {
@@ -1385,16 +1278,8 @@ export function CodexRemoteConsole() {
             return;
         }
         if (event.type === "turn.completed") {
-            setRemoteBusy(false);
-            if (!pendingPromptRef.current) {
-                setSending(false);
-                stopThreadPoll();
-                setTemporaryStatus("本轮完成", true);
-            } else {
-                setTemporaryStatus("本轮完成，正在同步记录...");
-                scheduleCompletionFallback();
-            }
-            upsertStreamMessage({ id: `done-${Date.now()}`, role: "status", text: pendingPromptRef.current ? "本轮完成，正在同步记录..." : "本轮完成" });
+            finishCurrentTurn("本轮完成", true);
+            upsertStreamMessage({ id: `done-${Date.now()}`, role: "status", text: "本轮完成" });
             return;
         }
         if (event.type === "error") {
@@ -1404,7 +1289,7 @@ export function CodexRemoteConsole() {
             return;
         }
         if ((event.type === "item.updated" || event.type === "item.completed") && itemType === "agent_message") {
-            if (settingsRef.current.receiveMode === "final") return;
+            if (settingsRef.current.receiveMode === "final" && event.type === "item.updated") return;
             const id = normalizeText(itemField(item, "id")) || createId();
             const text = normalizeText(itemField(item, "text"));
             if (text) {
@@ -1426,11 +1311,41 @@ export function CodexRemoteConsole() {
         }
     };
 
-    const connect = async (options: { quiet?: boolean; silent?: boolean; syncOnly?: boolean } = {}) => {
-        if (!options.syncOnly) {
-            setSyncPause(false);
-            eventSourceRef.current?.close();
-        }
+    const ensureRealtimeEvents = (agentEndpoint: string, options: { silent?: boolean; showProjectChooser?: boolean } = {}) => {
+        if (eventSourceRef.current && eventSourceRef.current.readyState !== EventSource.CLOSED) return eventSourceRef.current;
+        const source = new EventSource(withToken(agentEndpoint, `/events?clientId=mobile-codex-${Date.now()}`, settingsRef.current.token));
+        eventSourceRef.current = source;
+        source.addEventListener("hello", () => {
+            setConnected(true);
+            setConnecting(false);
+            setConnectionStatus("connected");
+            if (!options.silent && !options.showProjectChooser) setConnectionMessage("实时通道已连接");
+        });
+        source.addEventListener("agent_event", (event) => {
+            const data = parseEventData<AgentEvent>(event);
+            if (data) handleAgentEvent(data);
+        });
+        source.addEventListener("agent_error", (event) => {
+            const data = parseEventData<{ message?: string; thread_id?: string }>(event);
+            if (!data?.thread_id || data.thread_id !== (activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId))) return;
+            const message = data?.message || "Agent 出错";
+            failCurrentTurn(message);
+            pushMessage({ id: createId(), role: "error", title: "Agent", text: message });
+        });
+        source.onerror = () => {
+            setConnected(false);
+            setConnecting(false);
+            setConnectionStatus("offline");
+            if (!options.silent) setConnectionMessage("实时通道断开；发送和同步仍会尝试通过 HTTP 继续");
+            const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
+            const prompt = pendingPromptRef.current;
+            if (threadId && prompt) pollThreadUntilReply(threadId, normalizeCanvasId(settingsRef.current.canvasId), prompt);
+        };
+        return source;
+    };
+
+    const connect = async (options: { quiet?: boolean; silent?: boolean } = {}) => {
+        eventSourceRef.current?.close();
         if (!options.silent) {
             setConnecting(true);
             setConnected(false);
@@ -1444,6 +1359,7 @@ export function CodexRemoteConsole() {
                 settingsRef.current = { ...settingsRef.current, agentUrl: agentEndpoint };
                 updateSettings({ agentUrl: agentEndpoint });
             }
+            ensureRealtimeEvents(agentEndpoint, { silent: true });
             const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
             const threadId = normalizeThreadId(settingsRef.current.threadId) || activeThreadIdRef.current;
             const modelSettings = codexModelSettings(settingsRef.current);
@@ -1459,8 +1375,8 @@ export function CodexRemoteConsole() {
                 currentWorkspace = data.workspace || null;
             }
             const nextThreadId = threadId || currentWorkspace?.activeThreadId || "";
-            const projectChoiceNeeded = !options.syncOnly && shouldChooseWorkspaceAfterConnect(settingsRef.current);
-            const discoveredProjects = !options.syncOnly ? await refreshWorkspaceProjects(true) : [];
+            const projectChoiceNeeded = !options.quiet && shouldChooseWorkspaceAfterConnect(settingsRef.current);
+            const discoveredProjects = options.quiet ? projects : await refreshWorkspaceProjects(true);
             const showProjectChooser = projectChoiceNeeded && discoveredProjects.length > 0;
             setWorkspace(currentWorkspace);
             activeThreadIdRef.current = nextThreadId;
@@ -1469,66 +1385,26 @@ export function CodexRemoteConsole() {
             setConnected(true);
             setConnecting(false);
             setConnectionStatus("connected");
-            if (!options.silent) setConnectionMessage(showProjectChooser ? "已连接，请选择要继续的项目" : nextThreadId && !options.syncOnly ? "已连接，正在同步会话..." : "已连接电脑 Codex");
+            if (!options.silent) setConnectionMessage(showProjectChooser ? "已连接，请选择要继续的项目" : nextThreadId ? "已连接，正在同步会话..." : "已连接电脑 Codex");
             if (!options.quiet) pushMessage({ id: createId(), role: "status", text: "已连接电脑 Codex" });
-            if (!options.syncOnly) {
+            if (!options.quiet) {
                 void refreshGitRepos(true);
                 if (showProjectChooser) {
                     setSettingsOpen(false);
                     setThreadsOpen(true);
                     setTemporaryStatus("已发现电脑上的项目，请选择要继续的会话。", true);
-                    if (!options.quiet) pushMessage({ id: createId(), role: "status", text: "已发现电脑上的项目，已打开项目列表。" });
+                    pushMessage({ id: createId(), role: "status", text: "已发现电脑上的项目，已打开项目列表。" });
                 } else {
                     void refreshThreads(true);
                 }
-                if (!showProjectChooser && nextThreadId && !options.quiet) {
+                if (!showProjectChooser && nextThreadId) {
                     void syncThreadInBackground(nextThreadId, canvasId, { forceScroll: true, statusText: "会话已同步" }).then((ok) => {
                         if (ok && !options.silent) setConnectionMessage("已连接电脑 Codex");
                     });
                 }
             }
-            if (options.syncOnly && eventSourceRef.current && eventSourceRef.current.readyState !== EventSource.CLOSED) return true;
 
-            const source = new EventSource(withToken(agentEndpoint, `/events?clientId=mobile-codex-${Date.now()}`, settingsRef.current.token));
-            eventSourceRef.current = source;
-            source.addEventListener("hello", () => {
-                setConnected(true);
-                setConnecting(false);
-                setConnectionStatus("connected");
-                if (!options.silent && !showProjectChooser) setConnectionMessage("实时通道已连接");
-            });
-            source.addEventListener("agent_event", (event) => {
-                const data = parseEventData<AgentEvent>(event);
-                if (data) handleAgentEvent(data);
-            });
-            source.addEventListener("agent_error", (event) => {
-                const data = parseEventData<{ message?: string }>(event);
-                const message = data?.message || "Agent 出错";
-                failCurrentTurn(message);
-                pushMessage({ id: createId(), role: "error", title: "Agent", text: message });
-            });
-            source.addEventListener("agent_done", () => {
-                const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
-                const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
-                const pendingPrompt = pendingPromptRef.current;
-                if (!threadId) {
-                    failCurrentTurn("没有可同步的 Codex 会话");
-                    return;
-                }
-                void refreshThreadMessages(threadId, canvasId, pendingPrompt).then(({ items, busy }) => {
-                    if (!busy && (!pendingPrompt || hasTurnCompletion(items, pendingPrompt))) {
-                        finishCurrentTurn("本轮完成", true);
-                    } else {
-                        scheduleCompletionFallback();
-                    }
-                });
-            });
-            source.onerror = () => {
-                setConnecting(false);
-                setConnectionStatus("offline");
-                if (!options.silent) setConnectionMessage("实时通道断开；发送和同步仍会尝试通过 HTTP 继续");
-                if (pendingPromptRef.current && !syncPausedRef.current) window.setTimeout(() => void autoSyncFromAgent("offline"), 1500);
-            };
+            ensureRealtimeEvents(agentEndpoint, { silent: options.silent, showProjectChooser });
             return true;
         } catch (error) {
             setConnecting(false);
@@ -1544,10 +1420,13 @@ export function CodexRemoteConsole() {
     };
 
     const selectProject = async (project: ProjectPreset) => {
-        if (codexBusy || pendingPromptRef.current || activeQueueTaskIdRef.current) {
-            pushMessage({ id: createId(), role: "status", text: "当前 Codex 任务还在执行，完成后再切换项目，避免把后续消息发到错误会话。" });
-            return;
-        }
+        stopThreadPoll();
+        clearPendingRun();
+        pendingPromptRef.current = "";
+        markActiveQueueTask("done");
+        setSending(false);
+        setRemoteBusy(false);
+        setRunStatus("");
         const nextSettings = sanitizeSettings({
             ...settingsRef.current,
             canvasId: project.canvasId,
@@ -1574,8 +1453,8 @@ export function CodexRemoteConsole() {
         }
 
         if (project.threadId) {
-            setTemporaryStatus(`已切换到 ${project.label}，正在同步会话...`);
-            await syncThreadInBackground(project.threadId, normalizeCanvasId(project.canvasId), { forceScroll: true, clearWhenEmpty: true, statusText: `已切换到 ${project.label}` });
+            setTemporaryStatus(`已切换到 ${project.label}`, true);
+            void syncThreadInBackground(project.threadId, normalizeCanvasId(project.canvasId), { forceScroll: true, clearWhenEmpty: true });
             return;
         }
 
@@ -1659,10 +1538,13 @@ export function CodexRemoteConsole() {
 
     const selectThread = async (thread: ThreadSummary) => {
         if (!thread.id) return;
-        if (codexBusy || pendingPromptRef.current || activeQueueTaskIdRef.current) {
-            pushMessage({ id: createId(), role: "status", text: "当前 Codex 任务还在执行，完成后再切换会话，避免把后续消息发到错误会话。" });
-            return;
-        }
+        stopThreadPoll();
+        clearPendingRun();
+        pendingPromptRef.current = "";
+        markActiveQueueTask("done");
+        setSending(false);
+        setRemoteBusy(false);
+        setRunStatus("");
         const threadProject = projectFromThread(thread, projects);
         if (threadProject) {
             setProjects((items) => {
@@ -1688,8 +1570,8 @@ export function CodexRemoteConsole() {
         updateSettings({ threadId: thread.id });
         setMessages(readStoredThreadMessages(thread.id) || readStoredMessages(canvasId));
         setThreadsOpen(false);
-        setTemporaryStatus("已切换会话，正在同步记录...");
-        void syncThreadInBackground(thread.id, canvasId, { forceScroll: true, clearWhenEmpty: true, statusText: "会话已同步" });
+        setTemporaryStatus("已切换会话", true);
+        void syncThreadInBackground(thread.id, canvasId, { forceScroll: true, clearWhenEmpty: true });
     };
 
     const pushCurrentCommit = async () => {
@@ -1795,9 +1677,10 @@ export function CodexRemoteConsole() {
             });
             if (data.threadId) {
                 spendDailyTurn();
+                activeThreadIdRef.current = data.threadId;
                 setActiveThreadId(data.threadId);
                 updateSettings({ threadId: data.threadId });
-                pollThreadUntilReply(data.threadId, canvasId, prompt);
+                if (!eventSourceRef.current || eventSourceRef.current.readyState !== EventSource.OPEN) pollThreadUntilReply(data.threadId, canvasId, prompt);
             }
             return true;
         } catch (error) {
@@ -2036,11 +1919,6 @@ export function CodexRemoteConsole() {
                                 <span className="truncate">{codexBusy || runStatus ? runStatus || (remoteBusy && !sending ? "当前会话运行中" : "Codex 后台执行中") : pendingGuides.length ? `${pendingGuides.length} 条待引导` : activeQueueCount ? `${activeQueueCount} 条任务排队中` : "任务队列"}</span>
                             </div>
                             <div className="flex shrink-0 items-center gap-2">
-                                {codexBusy || runStatus ? (
-                                    <button type="button" className="rounded-full border border-red-500/20 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-500/15 active:scale-95 dark:text-red-200" onClick={() => stopBackgroundSync()} title="只停止手机端同步，不会强行终止电脑上的 Codex 任务">
-                                        停止同步
-                                    </button>
-                                ) : null}
                                 {queuedTasks.some((task) => task.status === "done" || task.status === "failed") ? (
                                     <button type="button" className="text-xs font-medium text-stone-500 transition hover:text-stone-950 dark:text-stone-400 dark:hover:text-stone-100" onClick={clearFinishedQueue}>
                                         清理

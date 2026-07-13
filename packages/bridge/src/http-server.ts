@@ -40,7 +40,7 @@ export function startHttpServer() {
   saveConfig(config);
 
   const events = new EventHub();
-  const emit = (type: string, payload: unknown) => events.emitAll(type, payload);
+  const emit = (type: string, payload: unknown, context?: { threadId?: string; turnId?: string }) => events.emitAll(type, payload, context);
   const app = express();
   app.disable("x-powered-by");
   app.use(express.json({ limit: "30mb" }));

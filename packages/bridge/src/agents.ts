@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 
-import { VERSION } from "./config.js";
+import { codexSandboxMode, VERSION } from "./config.js";
 import type { AgentAttachment, AgentEmit } from "./types.js";
 
 type Json = Record<string, unknown>;
@@ -28,10 +28,8 @@ type ThreadListResult = {
   backwardsCursor: unknown;
 };
 
-let codexQueue: Promise<unknown> = Promise.resolve();
 let codexApp: CodexAppClient | null = null;
 let codexAppStart: Promise<CodexAppClient> | null = null;
-let codexThreadId = "";
 let threadListGeneration = 0;
 const threadListCache = new Map<string, { expiresAt: number; value: ThreadListResult }>();
 const threadListInFlight = new Map<string, Promise<ThreadListResult>>();
@@ -69,8 +67,7 @@ export async function runCodexTurn(
   options: CodexRunOptions = {},
 ) {
   if (!prompt.trim()) return;
-  codexQueue = codexQueue.catch(() => undefined).then(() => runCodexTurnNow(prompt, emit, attachments, options));
-  await codexQueue;
+  await runCodexTurnNow(prompt, emit, attachments, options);
 }
 
 export async function steerCodexTurn(
@@ -125,7 +122,7 @@ async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: Age
       cleanupDeferred = true;
     }
   } catch (error) {
-    emit("agent_error", { message: errorMessage(error) });
+    emit("agent_error", { message: errorMessage(error) }, { threadId: options.threadId });
   } finally {
     invalidateThreadListCache();
     if (!cleanupDeferred) await cleanupPreparedAttachments(prepared);
@@ -135,7 +132,6 @@ async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: Age
 export async function startCodexThread(emit: AgentEmit, cwd?: string, options: CodexModelOptions = {}) {
   const app = await getCodexApp(emit);
   const thread = await app.startThread(cwd, options);
-  codexThreadId = String(field(thread, "id") || "");
   invalidateThreadListCache();
   return thread;
 }
@@ -150,7 +146,6 @@ export async function resumeCodexThread(
   await loadCodexThread(emit, threadId, cwd, false);
   const thread = await app.resumeThread(threadId, cwd, options);
   assertThreadWorkspace(thread, cwd);
-  codexThreadId = String(field(thread, "id") || threadId);
   return { thread, messages: threadMessages(thread) };
 }
 
@@ -250,14 +245,10 @@ async function ensureCodexThread(app: CodexAppClient, options: CodexRunOptions) 
     assertThreadWorkspace(field(result, "thread") || {}, options.cwd);
     const thread = await app.resumeThread(options.threadId, options.cwd, options);
     assertThreadWorkspace(thread, options.cwd);
-    codexThreadId = String(field(thread, "id") || options.threadId);
-    return codexThreadId;
+    return String(field(thread, "id") || options.threadId);
   }
-  if (!codexThreadId) {
-    const thread = await app.startThread(options.cwd, options);
-    codexThreadId = String(field(thread, "id") || "");
-  }
-  return codexThreadId;
+  const thread = await app.startThread(options.cwd, options);
+  return String(field(thread, "id") || "");
 }
 
 class CodexAppClient {
@@ -269,9 +260,15 @@ class CodexAppClient {
   private pending = new Map<number, PendingRequest>();
   private activeTurns = new Map<string, PendingRequest>();
   private activeTurnByThread = new Map<string, string>();
+  private threadByTurn = new Map<string, string>();
+  private threadByItem = new Map<string, string>();
   private completedTurns = new Map<string, Error | null>();
 
   private constructor(private child: ChildProcess, private emit: AgentEmit) {}
+
+  private emitForThread(type: string, payload: unknown, context: { threadId?: string; turnId?: string } = {}) {
+    this.emit(type, payload, context);
+  }
 
   static async start(emit: AgentEmit) {
     const child = spawn(process.execPath, [codexBin(), "app-server", "--stdio"], {
@@ -284,10 +281,7 @@ class CodexAppClient {
     child.on("error", (error) => emit("agent_error", { message: error.message }));
     child.on("exit", (code) => {
       client.failAll(`Codex app-server exited: ${code ?? 0}`);
-      if (codexApp === client) {
-        codexApp = null;
-        codexThreadId = "";
-      }
+      if (codexApp === client) codexApp = null;
       emit("agent_log", { text: `Codex app-server exited: ${code ?? 0}` });
     });
     await client.request("initialize", {
@@ -302,7 +296,7 @@ class CodexAppClient {
     const result = await this.request("thread/start", {
       ...codexModelRequestOptions(options),
       approvalPolicy: "never",
-      sandbox: "workspace-write",
+      sandbox: codexSandboxMode(),
       config: codexConfig(options),
       ...(cwd ? { cwd } : {}),
       threadSource: "user",
@@ -317,7 +311,7 @@ class CodexAppClient {
       threadId,
       ...codexModelRequestOptions(options),
       approvalPolicy: "never",
-      sandbox: "workspace-write",
+      sandbox: codexSandboxMode(),
       config: codexConfig(options),
       ...(cwd ? { cwd } : {}),
     });
@@ -348,6 +342,8 @@ class CodexAppClient {
     const turnId = String(field(field(result, "turn"), "id") || "");
     if (!turnId) throw new Error("Codex app-server did not return a turn id.");
     this.activeTurnByThread.set(threadId, turnId);
+    this.threadByTurn.set(turnId, threadId);
+    this.emitForThread("agent_event", { agent: "codex", type: "turn.started", thread_id: threadId, turn_id: turnId }, { threadId, turnId });
     try {
       const completed = this.completedTurns.get(turnId);
       if (this.completedTurns.has(turnId)) {
@@ -358,6 +354,7 @@ class CodexAppClient {
       await new Promise((resolve, reject) => this.activeTurns.set(turnId, { resolve, reject }));
     } finally {
       if (this.activeTurnByThread.get(threadId) === turnId) this.activeTurnByThread.delete(threadId);
+      this.threadByTurn.delete(turnId);
     }
   }
 
@@ -382,7 +379,6 @@ class CodexAppClient {
         reject(new Error(`Codex app-server request timed out: ${method}`));
         if (codexApp === this) {
           codexApp = null;
-          codexThreadId = "";
         }
         this.child.kill();
       }, 30_000);
@@ -429,15 +425,16 @@ class CodexAppClient {
   }
 
   private handleNotification(method: string, params: Json) {
+    const context = this.notificationContext(method, params);
     if (method === "item/agentMessage/delta") {
-      this.emitDelta(params);
+      this.emitDelta(params, context);
       return;
     }
     if (method === "thread/tokenUsage/updated") this.lastUsage = normalizeUsage(params);
     const event = normalizeCodexNotification(method, params);
     if (!event) return;
     if (event.type === "turn.completed") event.usage = this.lastUsage;
-    this.emit("agent_event", { agent: "codex", ...event });
+    this.emitForThread("agent_event", { agent: "codex", ...event }, context);
     if (event.type !== "turn.completed") return;
 
     const turnId = String(field(params, "turnId") || field(field(params, "turn"), "id") || "");
@@ -451,17 +448,29 @@ class CodexAppClient {
     } else if (turnId) {
       this.completedTurns.set(turnId, error ? new Error(String(field(error, "message") || "Codex turn failed")) : null);
     }
-    this.emit("agent_event", { agent: "codex", type: "stream.summary", delta_count: this.deltaCount });
+    this.emitForThread("agent_event", { agent: "codex", type: "stream.summary", delta_count: this.deltaCount }, context);
     this.deltaCount = 0;
-    this.emit("agent_done", { agent: "codex", usage: event.usage });
+    this.emitForThread("agent_done", { agent: "codex", usage: event.usage }, context);
   }
 
-  private emitDelta(params: Json) {
+  private emitDelta(params: Json, context: { threadId?: string; turnId?: string }) {
     const id = String(field(params, "itemId") || "");
     const text = `${this.textByItem.get(id) || ""}${String(field(params, "delta") || "")}`;
     this.deltaCount += 1;
     this.textByItem.set(id, text);
-    this.emit("agent_event", { agent: "codex", type: "item.updated", item: { id, type: "agent_message", text } });
+    this.emitForThread("agent_event", { agent: "codex", type: "item.updated", item: { id, type: "agent_message", text } }, context);
+  }
+
+  private notificationContext(method: string, params: Json) {
+    const turnId = String(field(params, "turnId") || field(field(params, "turn"), "id") || "");
+    let threadId = String(field(params, "threadId") || field(field(params, "thread"), "id") || field(field(params, "turn"), "threadId") || "");
+    const itemId = String(field(params, "itemId") || field(field(params, "item"), "id") || "");
+    if (!threadId && turnId) threadId = this.threadByTurn.get(turnId) || "";
+    if (!threadId && itemId) threadId = this.threadByItem.get(itemId) || "";
+    if (method === "turn/started" && threadId && turnId) this.threadByTurn.set(turnId, threadId);
+    if (method === "item/started" && threadId && itemId) this.threadByItem.set(itemId, threadId);
+    if (method === "item/completed" && itemId) this.threadByItem.delete(itemId);
+    return { ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) };
   }
 
   private answerServerRequest(message: Json) {
@@ -497,6 +506,8 @@ class CodexAppClient {
     this.pending.clear();
     this.activeTurns.clear();
     this.activeTurnByThread.clear();
+    this.threadByTurn.clear();
+    this.threadByItem.clear();
   }
 }
 

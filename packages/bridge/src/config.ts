@@ -102,6 +102,12 @@ export function envAllowedOrigins() {
     .filter(Boolean);
 }
 
+export function codexSandboxMode() {
+  const value = String(process.env.CODEX_REMOTE_SANDBOX || "").trim();
+  if (["read-only", "workspace-write", "danger-full-access"].includes(value)) return value;
+  return "danger-full-access";
+}
+
 export function resolveWorkspacePath(value: string) {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));

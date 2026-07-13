@@ -20,6 +20,8 @@ codex-remote-bridge setup \
 - `--port`: 监听端口，默认 `17372`。
 - `--allowed-origin`: 允许的 Web origin，可重复传入。
 
+Bridge 默认使用 `danger-full-access`，以便沿用电脑上的 SSH、部署和跨目录操作能力。需要限制到项目工作区时，在启动 Bridge 前设置 `CODEX_REMOTE_SANDBOX=workspace-write`。
+
 配置保存到 `~/.codex-remote/config.json`。之后直接运行 `codex-remote-bridge`。
 
 ## 接口

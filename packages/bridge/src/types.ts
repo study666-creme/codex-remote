@@ -1,4 +1,9 @@
-export type AgentEmit = (type: string, payload: unknown) => void;
+export type AgentEventContext = {
+  threadId?: string;
+  turnId?: string;
+};
+
+export type AgentEmit = (type: string, payload: unknown, context?: AgentEventContext) => void;
 
 export type AgentAttachment = {
   name?: string;

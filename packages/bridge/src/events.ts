@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { ServerResponse } from "node:http";
 
 import { VERSION } from "./config.js";
+import type { AgentEventContext } from "./types.js";
 
 export class EventHub {
   private clients = new Map<string, ServerResponse>();
@@ -41,8 +42,9 @@ export class EventHub {
     });
   }
 
-  emitAll(type: string, payload: unknown) {
-    const event = { id: this.nextEventId++, type, payload };
+  emitAll(type: string, payload: unknown, context: AgentEventContext = {}) {
+    const contextualPayload = withEventContext(payload, context);
+    const event = { id: this.nextEventId++, type, payload: contextualPayload };
     if (type === "agent_event" || type === "agent_done" || type === "agent_error") {
       this.history.push(event);
       if (this.history.length > 400) this.history.splice(0, this.history.length - 400);
@@ -52,12 +54,20 @@ export class EventHub {
         this.clients.delete(clientId);
         return;
       }
-      sendEvent(client, type, payload, event.id);
+      sendEvent(client, type, contextualPayload, event.id);
     });
   }
 }
 
 type BufferedEvent = { id: number; type: string; payload: unknown };
+
+function withEventContext(payload: unknown, context: AgentEventContext) {
+  if (!context.threadId && !context.turnId) return payload;
+  const value: Record<string, unknown> = payload && typeof payload === "object" ? { ...(payload as Record<string, unknown>) } : { value: payload };
+  if (context.threadId && !value.thread_id) value.thread_id = context.threadId;
+  if (context.turnId && !value.turn_id) value.turn_id = context.turnId;
+  return value;
+}
 
 function sendEvent(res: ServerResponse, type: string, payload: unknown, id?: number) {
   res.write(`${id ? `id: ${id}\n` : ""}event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`);

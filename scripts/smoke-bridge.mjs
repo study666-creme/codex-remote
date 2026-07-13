@@ -180,6 +180,14 @@ async function testEventReplay() {
   assert(replay.includes('"sequence":2'), "SSE replay did not restore the event missed during reconnect.");
   assert(resumed.headers["Cache-Control"] === "no-cache, no-transform", "SSE response did not disable proxy transformation.");
   resumed.close();
+
+  const contextual = new FakeEventResponse();
+  hub.openEvents(new URL("http://127.0.0.1/events?clientId=mobile-context"), contextual);
+  hub.emitAll("agent_event", { type: "item.updated" }, { threadId: "thread-a", turnId: "turn-a" });
+  const contextualPayload = contextual.chunks.join("");
+  assert(contextualPayload.includes('"thread_id":"thread-a"'), "SSE event omitted its thread id.");
+  assert(contextualPayload.includes('"turn_id":"turn-a"'), "SSE event omitted its turn id.");
+  contextual.close();
 }
 
 async function writeFakeSession() {
