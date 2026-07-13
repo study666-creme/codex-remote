@@ -45,6 +45,7 @@ const settingsKey = "codex-remote-mobile:settings";
 const messagesKey = "codex-remote-mobile:messages";
 const threadMessagesKey = "codex-remote-mobile:thread-messages";
 const pendingRunKey = "codex-remote-mobile:pending-run";
+const runningThreadsKey = "codex-remote-mobile:running-threads";
 const queueKey = "codex-remote-mobile:task-queue";
 const pendingGuideKey = "codex-remote-mobile:pending-guide";
 const activeProjectKey = "codex-remote-mobile:active-project";
@@ -276,6 +277,20 @@ function writePendingRun(run: PendingRun) {
 
 function clearPendingRun() {
     localStorage.removeItem(pendingRunKey);
+}
+
+function readRunningThreads() {
+    if (typeof localStorage === "undefined") return [] as string[];
+    return readJson<string[]>(localStorage.getItem(runningThreadsKey), []).filter(Boolean);
+}
+
+function writeRunningThreads(threadIds: string[]) {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(runningThreadsKey, JSON.stringify([...new Set(threadIds.filter(Boolean))]));
+}
+
+function threadIsBusy(status = "") {
+    return ["running", "in_progress", "active", "busy", "pending"].includes(status.toLowerCase());
 }
 
 function samePath(a: string, b: string) {
@@ -528,6 +543,7 @@ export function CodexRemoteConsole() {
     const [pendingGuides, setPendingGuides] = useState<PendingGuide[]>([]);
     const [steeringGuideIds, setSteeringGuideIds] = useState<string[]>([]);
     const [remoteBusy, setRemoteBusy] = useState(false);
+    const [runningThreadIds, setRunningThreadIds] = useState<string[]>([]);
     const [dailyUsage, setDailyUsage] = useState(0);
     const [quotaUnlocked, setQuotaUnlocked] = useState(false);
     const [unlockCode, setUnlockCode] = useState("");
@@ -555,6 +571,7 @@ export function CodexRemoteConsole() {
 
     const canSend = useMemo(() => Boolean(input.trim() || attachments.length), [attachments.length, input]);
     const codexBusy = sending || remoteBusy;
+    const backgroundRunningCount = runningThreadIds.filter((threadId) => threadId !== activeThreadId).length;
     const quotaEnabled = codexRemoteDemoMode && Boolean(quotaUserId) && !quotaUnlocked;
     const quotaLabel = quotaUnlocked ? "已解锁无限" : `今日 ${Math.min(dailyUsage, codexRemoteDailyTurnLimit)}/${codexRemoteDailyTurnLimit}`;
     const activeQueueCount = useMemo(() => queueTaskCount(queuedTasks), [queuedTasks]);
@@ -579,6 +596,7 @@ export function CodexRemoteConsole() {
         const loadedSettings = sanitizeSettings(readJson<Partial<Settings>>(localStorage.getItem(settingsKey), {}));
         const storedProjects = localStorage.getItem(projectsKey);
         const cachedCatalog = readThreadCatalog();
+        setRunningThreadIds(readRunningThreads());
         const savedProjects = storedProjects === null ? projectPresets : normalizeProjectList(readJson<ProjectPreset[]>(storedProjects, []));
         const initialProjects = mergeProjectLists(savedProjects, cachedCatalog.projects);
         const savedProjectId = localStorage.getItem(activeProjectKey) || "";
@@ -772,6 +790,15 @@ export function CodexRemoteConsole() {
         pollingRunKeyRef.current = "";
     }
 
+    function setThreadRunning(threadId: string, running: boolean) {
+        if (!threadId) return;
+        setRunningThreadIds((current) => {
+            const next = running ? [...new Set([...current, threadId])] : current.filter((id) => id !== threadId);
+            writeRunningThreads(next);
+            return next;
+        });
+    }
+
     function stopCurrentFollow(message = "已停止关注当前任务，电脑上的 Codex 会继续运行。") {
         pendingPromptRef.current = "";
         threadSyncSeqRef.current += 1;
@@ -785,6 +812,7 @@ export function CodexRemoteConsole() {
     }
 
     function finishCurrentTurn(statusText = "本轮完成", autoClear = true) {
+        setThreadRunning(activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId), false);
         pendingPromptRef.current = "";
         setSending(false);
         setRemoteBusy(false);
@@ -796,6 +824,7 @@ export function CodexRemoteConsole() {
     }
 
     function failCurrentTurn(errorText: string) {
+        setThreadRunning(activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId), false);
         pendingPromptRef.current = "";
         setSending(false);
         setRemoteBusy(false);
@@ -1106,7 +1135,7 @@ export function CodexRemoteConsole() {
         if (!threadId) return false;
         const syncSeq = ++threadSyncSeqRef.current;
         try {
-            const data = await agentFetch<{ workspace?: Workspace; messages?: MobileMessage[] }>(`/agent/codex/threads/${encodeURIComponent(threadId)}/resume`, {
+            const data = await agentFetch<{ workspace?: Workspace; messages?: MobileMessage[]; busy?: boolean }>(`/agent/codex/threads/${encodeURIComponent(threadId)}/resume`, {
                 method: "POST",
                 body: JSON.stringify(workspaceRequestBody(canvasId, { workspacePath: settingsRef.current.workspacePath.trim() || undefined, ...codexModelSettings(settingsRef.current) })),
             });
@@ -1114,6 +1143,9 @@ export function CodexRemoteConsole() {
             setWorkspace(data.workspace || workspace);
             activeThreadIdRef.current = threadId;
             setActiveThreadId(threadId);
+            setThreadRunning(threadId, Boolean(data.busy));
+            setSending(Boolean(data.busy));
+            setRemoteBusy(Boolean(data.busy));
             if (!pendingPromptRef.current) {
                 if (data.messages?.length) applyThreadMessages(data.messages, "", { forceScroll: options.forceScroll });
                 else if (options.clearWhenEmpty) setMessages([]);
@@ -1140,6 +1172,11 @@ export function CodexRemoteConsole() {
             const data = await agentFetch<{ projects?: ProjectPreset[]; data?: ThreadSummary[] }>(`/agent/codex/workspaces?${query.toString()}`);
             const discoveredProjects = normalizeProjectList(data.projects || []);
             const nextThreads = data.data || [];
+            setRunningThreadIds((current) => {
+                const next = [...new Set([...current, ...nextThreads.filter((thread) => threadIsBusy(thread.status)).map((thread) => thread.id)])];
+                writeRunningThreads(next);
+                return next;
+            });
             const mergedProjects = mergeProjectLists(discoveredProjects, projects);
             setThreads(nextThreads);
             setProjects(mergedProjects);
@@ -1267,6 +1304,8 @@ export function CodexRemoteConsole() {
     };
 
     const handleAgentEvent = (event: AgentEvent) => {
+        if (event.thread_id && event.type === "turn.started") setThreadRunning(event.thread_id, true);
+        if (event.thread_id && (event.type === "turn.completed" || event.type === "error")) setThreadRunning(event.thread_id, false);
         if (!eventBelongsToVisibleThread(event)) return;
         const item = event.item;
         const itemType = normalizeText(itemField(item, "type"));
@@ -1441,6 +1480,9 @@ export function CodexRemoteConsole() {
         setWorkspace({ canvasId: project.canvasId, workspacePath: project.workspacePath, activeThreadId: project.threadId });
         activeThreadIdRef.current = project.threadId;
         setActiveThreadId(project.threadId);
+        const projectBusy = runningThreadIds.includes(project.threadId);
+        setSending(projectBusy);
+        setRemoteBusy(projectBusy);
         setThreadSearch("");
         setThreadError("");
         setMessages(readStoredThreadMessages(project.threadId) || readStoredMessages(project.canvasId));
@@ -1567,6 +1609,10 @@ export function CodexRemoteConsole() {
         activeThreadIdRef.current = thread.id;
         settingsRef.current = { ...settingsRef.current, threadId: thread.id };
         setActiveThreadId(thread.id);
+        const threadBusy = runningThreadIds.includes(thread.id) || threadIsBusy(thread.status);
+        setThreadRunning(thread.id, threadBusy);
+        setSending(threadBusy);
+        setRemoteBusy(threadBusy);
         updateSettings({ threadId: thread.id });
         setMessages(readStoredThreadMessages(thread.id) || readStoredMessages(canvasId));
         setThreadsOpen(false);
@@ -1679,6 +1725,7 @@ export function CodexRemoteConsole() {
                 spendDailyTurn();
                 activeThreadIdRef.current = data.threadId;
                 setActiveThreadId(data.threadId);
+                setThreadRunning(data.threadId, true);
                 updateSettings({ threadId: data.threadId });
                 if (!eventSourceRef.current || eventSourceRef.current.readyState !== EventSource.OPEN) pollThreadUntilReply(data.threadId, canvasId, prompt);
             }
@@ -1848,10 +1895,10 @@ export function CodexRemoteConsole() {
                 </div>
             ) : null}
 
-            {codexBusy || runStatus ? (
+            {codexBusy || runStatus || backgroundRunningCount ? (
                 <div className="canvas-black-glass-sweep relative isolate shrink-0 overflow-hidden border-b border-sky-300/15 bg-[#111316] px-4 py-2 text-xs leading-5 shadow-[inset_0_1px_0_rgba(255,255,255,.05)] dark:border-white/10">
                     <span className="mobile-agent-thinking-sweep-text relative z-10 font-medium">
-                        {runStatus || (remoteBusy && !sending ? "当前 Codex 会话正在运行。新输入会先悬浮为待引导。" : "Codex 后台执行中。手机锁屏或切后台后，回到页面会自动同步当前会话记录。")}
+                        {runStatus || (codexBusy ? "Codex 后台执行中。切换会话不会停止电脑上的任务。" : `另有 ${backgroundRunningCount} 个会话正在后台执行，点回对应会话可查看进度。`)}
                     </span>
                 </div>
             ) : null}
@@ -2247,7 +2294,10 @@ export function CodexRemoteConsole() {
                                                             ].join(" ")}
                                                             onClick={() => void selectProject(project)}
                                                         >
-                                                            <div className="text-sm font-medium leading-5">默认会话</div>
+                                                            <div className="flex items-center justify-between gap-2 text-sm font-medium leading-5">
+                                                                <span>默认会话</span>
+                                                                {runningThreadIds.includes(project.threadId) ? <span className="mobile-agent-thinking-sweep-text text-[11px]">执行中</span> : null}
+                                                            </div>
                                                             <div className="mt-1 truncate text-[11px] opacity-55">{project.threadId}</div>
                                                         </button>
                                                     ) : null}
@@ -2273,7 +2323,10 @@ export function CodexRemoteConsole() {
                                                                         ].join(" ")}
                                                                         onClick={() => void selectThread(thread)}
                                                                     >
-                                                                        <div className="line-clamp-2 text-sm font-medium leading-5">{threadTitle(thread)}</div>
+                                                                        <div className="flex items-start justify-between gap-2 text-sm font-medium leading-5">
+                                                                            <span className="line-clamp-2">{threadTitle(thread)}</span>
+                                                                            {runningThreadIds.includes(thread.id) || threadIsBusy(thread.status) ? <span className="mobile-agent-thinking-sweep-text shrink-0 text-[11px]">执行中</span> : null}
+                                                                        </div>
                                                                         <div className="mt-1 flex items-center justify-between gap-2 text-[11px] opacity-55">
                                                                             <span className="truncate">{thread.id}</span>
                                                                             <span className="shrink-0">{formatThreadTime(thread.updatedAt || thread.createdAt)}</span>
