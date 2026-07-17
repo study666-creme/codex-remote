@@ -349,6 +349,38 @@ try {
   if (attachmentRequest.attachments[0].kind !== "document" || !String(attachmentRequest.attachments[0].dataUrl || "").startsWith("data:text/plain;base64,")) throw new Error("The document payload was incomplete");
   await page.close();
   console.log("Verified stale busy state does not queue a new attachment turn");
+
+  let steerRequestCount = 0;
+  let steerRequestBody;
+  page = await createPage({
+    busy: true,
+    guides: [{ id: "guide-dedupe", text: "只引导当前任务一次", attachments: [], createdAt: Date.now() }],
+    agentHandler: async ({ request, url, headers }) => {
+      if (url.pathname === "/agent/codex/status") {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        return { status: 200, headers, json: { ok: true, workspace, busy: true, canSteer: true, activeTurnId: "turn-a" } };
+      }
+      if (url.pathname === "/agent/codex/turn/steer" && request.method() === "POST") {
+        steerRequestCount += 1;
+        steerRequestBody = request.postDataJSON();
+        return { status: 200, headers, json: { ok: true, threadId: "thread-a" } };
+      }
+      return null;
+    },
+  });
+  await page.getByRole("button", { name: "引导", exact: true }).waitFor();
+  await page.evaluate(() => {
+    const button = [...document.querySelectorAll("button")].find((item) => item.textContent?.trim() === "引导");
+    if (!(button instanceof HTMLButtonElement)) throw new Error("Guide button was not found");
+    button.click();
+    button.click();
+    button.click();
+  });
+  await page.waitForFunction(() => !localStorage.getItem("codex-remote-mobile:pending-guide"), undefined, { timeout: 3000 });
+  if (steerRequestCount !== 1) throw new Error(`One guide tap sequence sent ${steerRequestCount} steer requests`);
+  if (steerRequestBody?.requestId !== "guide-dedupe") throw new Error("The steer request did not include its idempotency id");
+  await page.close();
+  console.log("Verified repeated mobile guide clicks steer exactly once");
 } finally {
   await browser?.close();
   await server.close();

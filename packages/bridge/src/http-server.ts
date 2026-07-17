@@ -165,7 +165,8 @@ export function startHttpServer() {
     const workspace = ensureWorkspace(config, requestWorkspaceId(req));
     const threadId = String(req.body?.threadId || workspace.activeThreadId || "");
     if (!threadId) throw new Error("There is no active Codex thread to steer.");
-    await steerCodexTurn(String(req.body?.prompt || ""), emit, attachments, { threadId, cwd: workspace.workspacePath });
+    const requestId = String(req.get("idempotency-key") || req.body?.requestId || "");
+    await steerCodexTurn(String(req.body?.prompt || ""), emit, attachments, { threadId, cwd: workspace.workspacePath, requestId });
     res.json({ ok: true, threadId });
   }));
   app.get("/agent/git/repos", (req, res) => {

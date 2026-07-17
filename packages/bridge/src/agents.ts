@@ -12,6 +12,7 @@ type AgentEvent = Json & { type: string; usage?: unknown };
 type PendingRequest = { resolve: (value: unknown) => void; reject: (error: Error) => void; timer?: ReturnType<typeof setTimeout> };
 type CodexModelOptions = { model?: string; effort?: string };
 type CodexRunOptions = { threadId?: string; cwd?: string } & CodexModelOptions;
+type CodexSteerOptions = Required<Pick<CodexRunOptions, "threadId">> & Pick<CodexRunOptions, "cwd"> & { requestId?: string };
 type DocumentMention = { name: string; path: string };
 type PreparedAttachments = { images: string[]; documents: DocumentMention[]; cleanupPaths: string[] };
 type AgentHistoryMessage = {
@@ -33,7 +34,10 @@ let codexAppStart: Promise<CodexAppClient> | null = null;
 let threadListGeneration = 0;
 const threadListCache = new Map<string, { expiresAt: number; value: ThreadListResult }>();
 const threadListInFlight = new Map<string, Promise<ThreadListResult>>();
+const steerRequests = new Map<string, Promise<void>>();
 const THREAD_LIST_CACHE_MS = 10_000;
+const STEER_REQUEST_CACHE_MS = 10 * 60_000;
+const STEER_REQUEST_CACHE_LIMIT = 256;
 const CODEX_SESSION_TAIL_BYTES = 8 * 1024 * 1024;
 const CODEX_SESSION_HEAD_BYTES = 1024 * 1024;
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
@@ -97,9 +101,37 @@ export async function steerCodexTurn(
   prompt: string,
   emit: AgentEmit,
   attachments: AgentAttachment[] = [],
-  options: Required<Pick<CodexRunOptions, "threadId">> & Pick<CodexRunOptions, "cwd">,
+  options: CodexSteerOptions,
 ) {
   if (!prompt.trim()) throw new Error("Steering prompt cannot be empty.");
+  const requestId = String(options.requestId || "").trim().slice(0, 200);
+  const requestKey = requestId ? `${options.threadId}\u0000${requestId}` : "";
+  const existing = requestKey ? steerRequests.get(requestKey) : undefined;
+  if (existing) return existing;
+
+  const request = executeCodexSteer(prompt, emit, attachments, options);
+  if (requestKey) {
+    if (steerRequests.size >= STEER_REQUEST_CACHE_LIMIT) {
+      const oldest = steerRequests.keys().next().value;
+      if (oldest) steerRequests.delete(oldest);
+    }
+    steerRequests.set(requestKey, request);
+    void request.then(
+      () => {
+        const timer = setTimeout(() => {
+          if (steerRequests.get(requestKey) === request) steerRequests.delete(requestKey);
+        }, STEER_REQUEST_CACHE_MS);
+        timer.unref();
+      },
+      () => {
+        if (steerRequests.get(requestKey) === request) steerRequests.delete(requestKey);
+      },
+    );
+  }
+  return request;
+}
+
+async function executeCodexSteer(prompt: string, emit: AgentEmit, attachments: AgentAttachment[], options: CodexSteerOptions) {
   let prepared = emptyPreparedAttachments();
   let cleanupDeferred = false;
   try {

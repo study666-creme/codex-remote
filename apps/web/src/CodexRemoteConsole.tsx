@@ -560,6 +560,7 @@ export function CodexRemoteConsole() {
     const activeQueueTaskIdRef = useRef("");
     const queuedTasksRef = useRef<QueuedTask[]>([]);
     const pendingGuidesRef = useRef<PendingGuide[]>([]);
+    const steeringGuideIdsRef = useRef(new Set<string>());
     const settingsRef = useRef<Settings>(defaultSettings);
     const activeThreadIdRef = useRef("");
     const threadSyncSeqRef = useRef(0);
@@ -978,25 +979,28 @@ export function CodexRemoteConsole() {
             setTemporaryStatus("当前没有可引导的 Codex 会话。", true);
             return;
         }
-        const busy = await currentTurnBusy();
-        if (!busy) {
-            clearPendingGuide(id);
-            setTemporaryStatus("当前没有运行任务，已立即发送。", true);
-            const ok = await submitPrompt(text, draft.attachments || []);
-            if (!ok) {
-                const next = [draft, ...pendingGuidesRef.current].slice(0, 20);
-                pendingGuidesRef.current = next;
-                setPendingGuides(next);
-            }
-            return;
-        }
-        if (!hasDailyTurnQuota("引导")) return;
-        setSteeringGuideIds((items) => [...items, id]);
+        if (steeringGuideIdsRef.current.has(id)) return;
+        steeringGuideIdsRef.current.add(id);
+        setSteeringGuideIds((items) => (items.includes(id) ? items : [...items, id]));
         try {
+            const busy = await currentTurnBusy();
+            if (!busy) {
+                clearPendingGuide(id);
+                setTemporaryStatus("当前没有运行任务，已立即发送。", true);
+                const ok = await submitPrompt(text, draft.attachments || []);
+                if (!ok) {
+                    const next = [draft, ...pendingGuidesRef.current].slice(0, 20);
+                    pendingGuidesRef.current = next;
+                    setPendingGuides(next);
+                }
+                return;
+            }
+            if (!hasDailyTurnQuota("引导")) return;
             await agentFetch<{ threadId?: string }>("/agent/codex/turn/steer", {
                 method: "POST",
                 body: JSON.stringify(workspaceRequestBody(normalizeCanvasId(settingsRef.current.canvasId), {
                     threadId,
+                    requestId: id,
                     prompt: text,
                     attachments: draft.attachments || [],
                     ...codexModelSettings(settingsRef.current),
@@ -1012,6 +1016,7 @@ export function CodexRemoteConsole() {
             setTemporaryStatus("");
             pushMessage({ id: createId(), role: "error", title: "引导失败", text: fallbackMessage });
         } finally {
+            steeringGuideIdsRef.current.delete(id);
             setSteeringGuideIds((items) => items.filter((item) => item !== id));
         }
     }
