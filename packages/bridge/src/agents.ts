@@ -60,14 +60,37 @@ function getCodexApp(emit: AgentEmit) {
   return codexAppStart;
 }
 
-export async function runCodexTurn(
+export async function beginCodexTurn(
   prompt: string,
   emit: AgentEmit,
   attachments: AgentAttachment[] = [],
   options: CodexRunOptions = {},
 ) {
-  if (!prompt.trim()) return;
-  await runCodexTurnNow(prompt, emit, attachments, options);
+  if (!prompt.trim()) throw new Error("Prompt cannot be empty.");
+  let prepared = emptyPreparedAttachments();
+  try {
+    prepared = await prepareAttachmentFiles(attachments);
+    const app = await getCodexApp(emit);
+    const threadId = await ensureCodexThread(app, options);
+    const { turnId, completion } = await app.beginTurn(threadId, prompt, prepared.images, prepared.documents, options);
+    const receipt = {
+      accepted: prepared.images.length + prepared.documents.length,
+      images: prepared.images.length,
+      documents: prepared.documents.length,
+      names: attachments.map((item) => item.name || "attachment"),
+    };
+    invalidateThreadListCache();
+    void completion
+      .catch((error) => emit("agent_error", { message: errorMessage(error) }, { threadId, turnId }))
+      .finally(async () => {
+        invalidateThreadListCache();
+        await cleanupPreparedAttachments(prepared);
+      });
+    return { threadId, turnId, attachments: receipt };
+  } catch (error) {
+    await cleanupPreparedAttachments(prepared);
+    throw error;
+  }
 }
 
 export async function steerCodexTurn(
@@ -107,26 +130,6 @@ export async function getCodexThreadStatus(emit: AgentEmit, threadId: string, cw
   const activeTurnId = localActiveTurnId || inferredActiveTurnId || "";
   const busy = Boolean(activeTurnId) || busyStatus(String(thread?.status || ""));
   return { thread, busy, activeTurnId, canSteer: Boolean(activeTurnId) };
-}
-
-async function runCodexTurnNow(prompt: string, emit: AgentEmit, attachments: AgentAttachment[], options: CodexRunOptions) {
-  let prepared = emptyPreparedAttachments();
-  let cleanupDeferred = false;
-  try {
-    prepared = await prepareAttachmentFiles(attachments);
-    const app = await getCodexApp(emit);
-    const threadId = await ensureCodexThread(app, options);
-    await app.startTurn(threadId, prompt, prepared.images, prepared.documents, options);
-    if (prepared.documents.length) {
-      deferAttachmentCleanup(prepared);
-      cleanupDeferred = true;
-    }
-  } catch (error) {
-    emit("agent_error", { message: errorMessage(error) }, { threadId: options.threadId });
-  } finally {
-    invalidateThreadListCache();
-    if (!cleanupDeferred) await cleanupPreparedAttachments(prepared);
-  }
 }
 
 export async function startCodexThread(emit: AgentEmit, cwd?: string, options: CodexModelOptions = {}) {
@@ -332,7 +335,7 @@ class CodexAppClient {
     return this.request("thread/archive", { threadId });
   }
 
-  async startTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], options: CodexModelOptions = {}) {
+  async beginTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], options: CodexModelOptions = {}) {
     const result = await this.request("turn/start", {
       threadId,
       input: codexInput(prompt, images, documents),
@@ -344,18 +347,19 @@ class CodexAppClient {
     this.activeTurnByThread.set(threadId, turnId);
     this.threadByTurn.set(turnId, threadId);
     this.emitForThread("agent_event", { agent: "codex", type: "turn.started", thread_id: threadId, turn_id: turnId }, { threadId, turnId });
-    try {
-      const completed = this.completedTurns.get(turnId);
-      if (this.completedTurns.has(turnId)) {
-        this.completedTurns.delete(turnId);
-        if (completed) throw completed;
-        return;
-      }
-      await new Promise((resolve, reject) => this.activeTurns.set(turnId, { resolve, reject }));
-    } finally {
+    const completed = this.completedTurns.get(turnId);
+    let completion: Promise<unknown>;
+    if (this.completedTurns.has(turnId)) {
+      this.completedTurns.delete(turnId);
+      completion = completed ? Promise.reject(completed) : Promise.resolve();
+    } else {
+      completion = new Promise((resolve, reject) => this.activeTurns.set(turnId, { resolve, reject }));
+    }
+    completion = completion.finally(() => {
       if (this.activeTurnByThread.get(threadId) === turnId) this.activeTurnByThread.delete(threadId);
       this.threadByTurn.delete(turnId);
-    }
+    });
+    return { turnId, completion };
   }
 
   steerTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], activeTurnId = "") {

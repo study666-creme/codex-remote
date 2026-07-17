@@ -19,7 +19,7 @@ import {
   getCodexThreadStatus,
   listCodexThreads,
   readCodexThreadFast,
-  runCodexTurn,
+  beginCodexTurn,
   startCodexThread,
   steerCodexTurn,
   summarizeCodexThread,
@@ -157,8 +157,8 @@ export function startHttpServer() {
       await verifyCodexThreadWorkspace(emit, threadId, saved.workspacePath);
       updateWorkspace(config, saved.workspaceId, { activeThreadId: threadId });
     }
-    void runCodexTurn(prompt, emit, attachments, { threadId, cwd: saved.workspacePath, ...modelOptions });
-    res.json({ ok: true, threadId });
+    const started = await beginCodexTurn(prompt, emit, attachments, { threadId, cwd: saved.workspacePath, ...modelOptions });
+    res.json({ ok: true, ...started });
   }));
   app.post("/agent/codex/turn/steer", route(async (req, res) => {
     const attachments = Array.isArray(req.body?.attachments) ? (req.body.attachments as AgentAttachment[]) : [];

@@ -284,7 +284,10 @@ try {
     agentHandler: async ({ request, url, headers }) => {
       if (url.pathname === "/agent/codex/turn" && request.method() === "POST") {
         turnAccepted = true;
-        return { status: 200, headers, json: { ok: true, threadId: "thread-a" } };
+        return { status: 200, headers, json: { ok: true, threadId: "thread-a", attachments: { accepted: 0, images: 0, documents: 0 } } };
+      }
+      if (turnAccepted && url.pathname === "/agent/codex/status") {
+        return { status: 200, headers, json: { ok: true, workspace, busy: !historyComplete, canSteer: !historyComplete, activeTurnId: historyComplete ? "" : "turn-delayed" } };
       }
       if (turnAccepted && url.pathname === "/agent/codex/threads/thread-a" && request.method() === "GET") {
         return {
@@ -316,7 +319,36 @@ try {
   await page.getByText(delayedReply, { exact: true }).waitFor({ timeout: 10_000 });
   await page.waitForFunction(() => !localStorage.getItem("codex-remote-mobile:pending-run"), undefined, { timeout: 3000 });
   await page.close();
-  console.log("Verified pending messages survive stale thread sync");
+  console.log("Verified status polling completes a turn without an SSE completion event");
+
+  let attachmentRequest;
+  let staleStatusChecks = 0;
+  page = await createPage({
+    busy: true,
+    agentHandler: async ({ request, url, headers }) => {
+      if (url.pathname === "/agent/codex/status") {
+        staleStatusChecks += 1;
+        return { status: 200, headers, json: { ok: true, workspace, busy: false, canSteer: false, activeTurnId: "" } };
+      }
+      if (url.pathname === "/agent/codex/turn" && request.method() === "POST") {
+        attachmentRequest = request.postDataJSON();
+        return { status: 200, headers, json: { ok: true, threadId: "thread-a", turnId: "turn-file", attachments: { accepted: 1, images: 0, documents: 1 } } };
+      }
+      return null;
+    },
+  });
+  await page.locator('input[type="file"][accept*=".txt"]').setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("attachment body") });
+  await page.getByText("TXT", { exact: true }).waitFor();
+  await page.locator("textarea").fill("读取这个附件并继续");
+  const attachmentTurn = page.waitForRequest((request) => new URL(request.url()).pathname === "/agent/codex/turn");
+  await page.getByRole("button", { name: /加入引导|发送/ }).click();
+  await attachmentTurn;
+  await page.waitForFunction(() => !localStorage.getItem("codex-remote-mobile:pending-guide"), undefined, { timeout: 3000 });
+  if (!staleStatusChecks) throw new Error("A stale local busy state was not reconciled with the Bridge");
+  if (attachmentRequest?.attachments?.length !== 1) throw new Error("The document was not included in the Codex turn request");
+  if (attachmentRequest.attachments[0].kind !== "document" || !String(attachmentRequest.attachments[0].dataUrl || "").startsWith("data:text/plain;base64,")) throw new Error("The document payload was incomplete");
+  await page.close();
+  console.log("Verified stale busy state does not queue a new attachment turn");
 } finally {
   await browser?.close();
   await server.close();

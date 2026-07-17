@@ -539,6 +539,7 @@ export function CodexRemoteConsole() {
     const [threadSearch, setThreadSearch] = useState("");
     const [threadError, setThreadError] = useState("");
     const [attachments, setAttachments] = useState<AgentAttachment[]>([]);
+    const [attachmentsReading, setAttachmentsReading] = useState(0);
     const [queuedTasks, setQueuedTasks] = useState<QueuedTask[]>([]);
     const [pendingGuides, setPendingGuides] = useState<PendingGuide[]>([]);
     const [steeringGuideIds, setSteeringGuideIds] = useState<string[]>([]);
@@ -569,7 +570,7 @@ export function CodexRemoteConsole() {
     const documentInputRef = useRef<HTMLInputElement>(null);
     const atBottomRef = useRef(true);
 
-    const canSend = useMemo(() => Boolean(input.trim() || attachments.length), [attachments.length, input]);
+    const canSend = useMemo(() => attachmentsReading === 0 && Boolean(input.trim() || attachments.length), [attachments.length, attachmentsReading, input]);
     const codexBusy = sending || remoteBusy;
     const backgroundRunningCount = runningThreadIds.filter((threadId) => threadId !== activeThreadId).length;
     const quotaEnabled = codexRemoteDemoMode && Boolean(quotaUserId) && !quotaUnlocked;
@@ -723,7 +724,7 @@ export function CodexRemoteConsole() {
             pendingPromptRef.current = pendingRun.prompt;
             setSending(true);
             setTemporaryStatus("Codex 正在执行...");
-            if (!eventSourceRef.current || eventSourceRef.current.readyState === EventSource.CLOSED) pollThreadUntilReply(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
+            pollThreadUntilReply(pendingRun.threadId, pendingRun.canvasId, pendingRun.prompt);
         }
         try {
             ensureRealtimeEvents(validateAgentUrl(settingsRef.current.agentUrl), { silent: true });
@@ -797,18 +798,6 @@ export function CodexRemoteConsole() {
             writeRunningThreads(next);
             return next;
         });
-    }
-
-    function stopCurrentFollow(message = "已停止关注当前任务，电脑上的 Codex 会继续运行。") {
-        pendingPromptRef.current = "";
-        threadSyncSeqRef.current += 1;
-        setSending(false);
-        setRemoteBusy(false);
-        clearPendingRun();
-        stopThreadPoll();
-        setConnectionMessage(message);
-        setTemporaryStatus("");
-        markActiveQueueTask("failed", message);
     }
 
     function finishCurrentTurn(statusText = "本轮完成", autoClear = true) {
@@ -948,8 +937,32 @@ export function CodexRemoteConsole() {
     }
 
     async function currentTurnBusy() {
-        if (sending || pendingPromptRef.current || activeQueueTaskIdRef.current || remoteBusy) return true;
-        return false;
+        const localBusy = Boolean(sending || pendingPromptRef.current || activeQueueTaskIdRef.current || remoteBusy);
+        if (!localBusy) return false;
+        const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
+        if (!threadId || !settingsRef.current.agentUrl.trim() || !settingsRef.current.token.trim()) return localBusy;
+        try {
+            const query = workspaceSearchParams(normalizeCanvasId(settingsRef.current.canvasId));
+            query.set("threadId", threadId);
+            const data = await agentFetch<{ busy?: boolean }>(`/agent/codex/status?${query.toString()}`);
+            if (data.busy) {
+                setThreadRunning(threadId, true);
+                setSending(true);
+                setRemoteBusy(true);
+                return true;
+            }
+            pendingPromptRef.current = "";
+            setThreadRunning(threadId, false);
+            setSending(false);
+            setRemoteBusy(false);
+            clearPendingRun();
+            stopThreadPoll();
+            markActiveQueueTask("done");
+            await refreshThreadMessages(threadId, normalizeCanvasId(settingsRef.current.canvasId), "", { forceScroll: true }).catch(() => undefined);
+            return false;
+        } catch {
+            return localBusy;
+        }
     }
 
     async function confirmPendingGuide(id: string, extraGuide = "") {
@@ -1055,16 +1068,6 @@ export function CodexRemoteConsole() {
         return -1;
     }
 
-    function hasReplyAfterPrompt(items: MobileMessage[], prompt: string) {
-        const index = promptIndex(items, prompt);
-        return index >= 0 && items.slice(index + 1).some((item) => item.role === "assistant" || item.role === "error");
-    }
-
-    function hasTurnCompletion(items: MobileMessage[], prompt: string) {
-        if (!prompt.trim()) return items.some((item) => item.role === "assistant" || item.role === "error");
-        return hasReplyAfterPrompt(items, prompt);
-    }
-
     function applyThreadMessages(items: MobileMessage[] | undefined, pendingPrompt = "", options: { requirePromptMatch?: boolean; forceScroll?: boolean } = {}) {
         if (!items?.length) return [];
         const visibleItems = messagesForReceiveMode(items, settingsRef.current.receiveMode);
@@ -1146,6 +1149,12 @@ export function CodexRemoteConsole() {
             setThreadRunning(threadId, Boolean(data.busy));
             setSending(Boolean(data.busy));
             setRemoteBusy(Boolean(data.busy));
+            if (data.busy) {
+                const pendingRun = readPendingRun(canvasId);
+                pollThreadUntilReply(threadId, canvasId, pendingRun?.threadId === threadId ? pendingRun.prompt : "");
+            } else {
+                stopThreadPoll();
+            }
             if (!pendingPromptRef.current) {
                 if (data.messages?.length) applyThreadMessages(data.messages, "", { forceScroll: options.forceScroll });
                 else if (options.clearWhenEmpty) setMessages([]);
@@ -1262,39 +1271,42 @@ export function CodexRemoteConsole() {
     };
 
     const pollThreadUntilReply = (threadId: string, canvasId: string, prompt: string) => {
-        const runKey = `${canvasId}:${threadId}:${prompt}`;
+        const runKey = `${canvasId}:${threadId}`;
         if (pollingRunKeyRef.current === runKey) return;
         stopThreadPoll();
         pollingRunKeyRef.current = runKey;
-        writePendingRun({ threadId, canvasId, prompt, startedAt: Date.now() });
+        if (prompt) writePendingRun({ threadId, canvasId, prompt, startedAt: Date.now() });
         let attempts = 0;
         let consecutiveFailures = 0;
         const tick = async () => {
             if (pollingRunKeyRef.current !== runKey || activeThreadIdRef.current !== threadId) return;
             attempts += 1;
             try {
-                const { items, busy } = await refreshThreadMessages(threadId, canvasId, prompt);
+                const query = workspaceSearchParams(canvasId);
+                query.set("threadId", threadId);
+                const status = await agentFetch<{ busy?: boolean }>(`/agent/codex/status?${query.toString()}`);
+                if (pollingRunKeyRef.current !== runKey || activeThreadIdRef.current !== threadId) return;
                 consecutiveFailures = 0;
-                if (!busy && hasTurnCompletion(items, prompt)) {
+                if (!status.busy) {
+                    await refreshThreadMessages(threadId, canvasId, prompt, { forceScroll: true }).catch(() => undefined);
+                    if (pollingRunKeyRef.current !== runKey || activeThreadIdRef.current !== threadId) return;
                     finishCurrentTurn("本轮完成", true);
                     return;
                 }
+                setThreadRunning(threadId, true);
+                setSending(true);
+                setRemoteBusy(true);
             } catch (error) {
                 consecutiveFailures += 1;
                 if (consecutiveFailures >= 4) {
-                    stopCurrentFollow("电脑 Agent 连续 4 次不可达，已停止关注当前任务。电脑端任务可能仍在运行。");
-                    pushMessage({ id: createId(), role: "error", title: "连接已中断", text: error instanceof Error ? error.message : String(error) });
-                    return;
+                    setConnectionStatus("offline");
+                    setConnectionMessage("状态确认暂时失败，电脑任务仍会继续；正在自动重试。");
                 }
             }
-            if (attempts >= 60) {
-                stopCurrentFollow("等待 Codex 返回超时，已停止关注当前任务。电脑端任务可能仍在运行。");
-                return;
-            }
-            const delay = settingsRef.current.receiveMode === "final" ? 15000 : attempts < 4 ? 2500 : 5000;
+            const delay = consecutiveFailures >= 4 ? 10_000 : attempts < 4 ? 2000 : 4000;
             pollTimerRef.current = setTimeout(tick, delay);
         };
-        pollTimerRef.current = setTimeout(tick, settingsRef.current.receiveMode === "final" ? 10000 : 2000);
+        pollTimerRef.current = setTimeout(tick, 1500);
     };
 
     const eventBelongsToVisibleThread = (event: AgentEvent) => {
@@ -1314,6 +1326,7 @@ export function CodexRemoteConsole() {
             setRemoteBusy(true);
             setTemporaryStatus("Codex 正在思考...");
             upsertStreamMessage({ id: "turn-status", role: "status", text: "Codex 正在处理..." });
+            if (event.thread_id) pollThreadUntilReply(event.thread_id, normalizeCanvasId(settingsRef.current.canvasId), pendingPromptRef.current);
             return;
         }
         if (event.type === "turn.completed") {
@@ -1717,17 +1730,19 @@ export function CodexRemoteConsole() {
             const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
             const targetThreadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
             if (targetThreadId) writePendingRun({ threadId: targetThreadId, canvasId, prompt, startedAt: Date.now() });
-            const data = await agentFetch<{ threadId?: string }>("/agent/codex/turn", {
+            const data = await agentFetch<{ threadId?: string; attachments?: { accepted?: number; images?: number; documents?: number } }>("/agent/codex/turn", {
                 method: "POST",
                 body: JSON.stringify(workspaceRequestBody(canvasId, { prompt, threadId: targetThreadId || undefined, attachments: currentAttachments, ...codexModelSettings(settingsRef.current) })),
             });
             if (data.threadId) {
+                const acceptedAttachments = Number(data.attachments?.accepted || 0);
+                if (acceptedAttachments !== currentAttachments.length) throw new Error("附件传输未完成：选择了 " + currentAttachments.length + " 个，电脑只接收了 " + acceptedAttachments + " 个。");
                 spendDailyTurn();
                 activeThreadIdRef.current = data.threadId;
                 setActiveThreadId(data.threadId);
                 setThreadRunning(data.threadId, true);
                 updateSettings({ threadId: data.threadId });
-                if (!eventSourceRef.current || eventSourceRef.current.readyState !== EventSource.OPEN) pollThreadUntilReply(data.threadId, canvasId, prompt);
+                pollThreadUntilReply(data.threadId, canvasId, prompt);
             }
             return true;
         } catch (error) {
@@ -1779,6 +1794,10 @@ export function CodexRemoteConsole() {
 
     const submit = async (event?: FormEvent<HTMLFormElement>) => {
         event?.preventDefault();
+        if (attachmentsReading) {
+            setTemporaryStatus("附件正在读取，请稍候...", true);
+            return;
+        }
         const currentAttachments = attachments;
         const prompt = input.trim() || (currentAttachments.length ? "请根据所附图片或文档继续处理当前任务。" : "");
         if (!prompt) return;
@@ -1807,11 +1826,14 @@ export function CodexRemoteConsole() {
         }
         const files = selected.filter((file) => file.type.startsWith("image/")).slice(0, maxAttachmentCount);
         if (!files.length) return;
+        setAttachmentsReading((value) => value + 1);
         try {
             const next = await Promise.all(files.map((file) => readFileAsDataUrl(file, "image")));
             setAttachments((items) => [...items, ...next].slice(0, maxAttachmentCount));
         } catch (error) {
             pushMessage({ id: createId(), role: "error", title: "图片读取失败", text: error instanceof Error ? error.message : String(error) });
+        } finally {
+            setAttachmentsReading((value) => Math.max(0, value - 1));
         }
     };
 
@@ -1830,11 +1852,14 @@ export function CodexRemoteConsole() {
         }
         const files = selected.slice(0, maxAttachmentCount);
         if (!files.length) return;
+        setAttachmentsReading((value) => value + 1);
         try {
             const next = await Promise.all(files.map((file) => readFileAsDataUrl(file, "document")));
             setAttachments((items) => [...items, ...next].slice(0, maxAttachmentCount));
         } catch (error) {
             pushMessage({ id: createId(), role: "error", title: "文档读取失败", text: error instanceof Error ? error.message : String(error) });
+        } finally {
+            setAttachmentsReading((value) => Math.max(0, value - 1));
         }
     };
 
@@ -2100,20 +2125,20 @@ export function CodexRemoteConsole() {
                             }
                         }}
                         rows={1}
-                        placeholder={connected ? "让 Codex 继续做项目任务..." : "可以先输入，发送时会尝试连接电脑 Agent"}
+                        placeholder={attachmentsReading ? "正在读取附件..." : connected ? "让 Codex 继续做项目任务..." : "可以先输入，发送时会尝试连接电脑 Agent"}
                         className="max-h-36 min-h-10 flex-1 bg-transparent px-1 py-2 text-[16px] leading-6 outline-none placeholder:text-stone-400"
                     />
                     <button
                         type="button"
                         disabled={!canSend}
                         className="grid size-10 shrink-0 place-items-center rounded-2xl bg-[#0A84FF] text-white shadow-[0_8px_24px_rgba(10,132,255,.32)] transition enabled:hover:scale-[1.03] enabled:active:scale-95 disabled:bg-stone-300 disabled:text-stone-500 disabled:shadow-none dark:bg-[#0A84FF] dark:text-white dark:disabled:bg-white/10 dark:disabled:text-white/35"
-                        aria-label={codexBusy ? "加入引导" : "发送"}
+                        aria-label={attachmentsReading ? "正在读取附件" : codexBusy ? "加入引导" : "发送"}
                         onClick={(event) => {
                             event.preventDefault();
                             void submit();
                         }}
                     >
-                        {codexBusy ? <Plus className="size-4" /> : <SendHorizontal className="size-4" />}
+                        {attachmentsReading ? <LoaderCircle className="size-4 animate-spin" /> : codexBusy ? <Plus className="size-4" /> : <SendHorizontal className="size-4" />}
                     </button>
                 </div>
             </form>
