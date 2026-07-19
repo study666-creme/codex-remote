@@ -394,10 +394,19 @@ class CodexAppClient {
     return { turnId, completion };
   }
 
-  steerTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], activeTurnId = "") {
+  async steerTurn(threadId: string, prompt: string, images: string[], documents: DocumentMention[], activeTurnId = "") {
     const expectedTurnId = activeTurnId || this.activeTurnByThread.get(threadId);
     if (!expectedTurnId) throw new Error("This thread has no active Codex turn to steer.");
-    return this.request("turn/steer", { threadId, input: codexInput(prompt, images, documents), expectedTurnId });
+    const input = codexInput(prompt, images, documents);
+    try {
+      return await this.request("turn/steer", { threadId, input, expectedTurnId });
+    } catch (error) {
+      const mismatch = parseActiveTurnMismatch(error);
+      if (!mismatch?.found || mismatch.found === expectedTurnId) throw error;
+      this.activeTurnByThread.set(threadId, mismatch.found);
+      this.threadByTurn.set(mismatch.found, threadId);
+      return this.request("turn/steer", { threadId, input, expectedTurnId: mismatch.found });
+    }
   }
 
   activeTurnId(threadId?: string) {
@@ -503,7 +512,10 @@ class CodexAppClient {
     const itemId = String(field(params, "itemId") || field(field(params, "item"), "id") || "");
     if (!threadId && turnId) threadId = this.threadByTurn.get(turnId) || "";
     if (!threadId && itemId) threadId = this.threadByItem.get(itemId) || "";
-    if (method === "turn/started" && threadId && turnId) this.threadByTurn.set(turnId, threadId);
+    if (method === "turn/started" && threadId && turnId) {
+      this.threadByTurn.set(turnId, threadId);
+      this.activeTurnByThread.set(threadId, turnId);
+    }
     if (method === "item/started" && threadId && itemId) this.threadByItem.set(itemId, threadId);
     if (method === "item/completed" && itemId) this.threadByItem.delete(itemId);
     return { ...(threadId ? { threadId } : {}), ...(turnId ? { turnId } : {}) };
@@ -806,6 +818,11 @@ function activeTurnIdFromThread(thread: unknown) {
     if (!completedAt && !field(turn, "error") && busyStatus(String(field(thread, "status") || ""))) return id;
   }
   return "";
+}
+
+export function parseActiveTurnMismatch(error: unknown) {
+  const match = errorMessage(error).match(/expected active turn id\s+[`'"]([^`'"]+)[`'"]\s+but found\s+[`'"]([^`'"]+)[`'"]/i);
+  return match ? { expected: match[1], found: match[2] } : null;
 }
 
 function normalizeItem(item: unknown) {
