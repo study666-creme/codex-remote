@@ -1,14 +1,14 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, ChevronDown, Clock3, Copy, FileText, FileUp, FolderGit2, GitBranch, ImagePlus, ListTodo, LoaderCircle, Menu, Pencil, PlugZap, Plus, RefreshCcw, RotateCcw, SendHorizontal, Settings2, TerminalSquare, Trash2, UploadCloud, X } from "lucide-react";
+import { CheckCircle2, ChevronDown, Clock3, Copy, FileText, FileUp, FolderGit2, GitBranch, ImagePlus, ListTodo, LoaderCircle, Menu, Pencil, PlugZap, Plus, RefreshCcw, RotateCcw, SendHorizontal, Settings2, Square, TerminalSquare, Trash2, UploadCloud, X } from "lucide-react";
 
 type MessageRole = "user" | "assistant" | "tool" | "error" | "status";
 type MobileMessage = { id: string; role: MessageRole; title?: string; text: string; streamId?: string };
 type ReceiveMode = "full" | "text" | "final";
 type Settings = { agentUrl: string; token: string; canvasId: string; threadId: string; workspacePath: string; gitRepoPath: string; model: string; effort: string; receiveMode: ReceiveMode };
 type Workspace = { canvasId: string; workspaceId?: string; workspacePath: string; activeThreadId?: string; model?: string; effort?: string };
-type AgentEvent = { type?: string; item?: Record<string, unknown>; usage?: unknown; message?: string; thread_id?: string; turn_id?: string };
+type AgentEvent = { type?: string; item?: Record<string, unknown>; usage?: unknown; message?: string; thread_id?: string; turn_id?: string; will_retry?: boolean };
 type PendingRun = { threadId: string; canvasId: string; prompt: string; startedAt: number };
 type ConnectionStatus = "idle" | "connecting" | "connected" | "offline" | "error";
 type GitRemoteInfo = { name: string; url: string };
@@ -552,6 +552,7 @@ export function CodexRemoteConsole() {
     const [demoNoticeOpen, setDemoNoticeOpen] = useState(false);
     const [runStatus, setRunStatus] = useState("");
     const [unreadCount, setUnreadCount] = useState(0);
+    const [resettingModelSettings, setResettingModelSettings] = useState(false);
     const eventSourceRef = useRef<EventSource | null>(null);
     const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -570,6 +571,8 @@ export function CodexRemoteConsole() {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const documentInputRef = useRef<HTMLInputElement>(null);
     const atBottomRef = useRef(true);
+    const failedTurnKeysRef = useRef(new Map<string, string>());
+    const recentUnscopedErrorRef = useRef<{ id: string; message: string; at: number } | null>(null);
 
     const canSend = useMemo(() => attachmentsReading === 0 && Boolean(input.trim() || attachments.length), [attachments.length, attachmentsReading, input]);
     const codexBusy = sending || remoteBusy;
@@ -945,8 +948,8 @@ export function CodexRemoteConsole() {
         try {
             const query = workspaceSearchParams(normalizeCanvasId(settingsRef.current.canvasId));
             query.set("threadId", threadId);
-            const data = await agentFetch<{ busy?: boolean }>(`/agent/codex/status?${query.toString()}`);
-            if (data.busy) {
+            const data = await agentFetch<{ busy?: boolean; canSteer?: boolean; stale?: boolean }>(`/agent/codex/status?${query.toString()}`);
+            if (data.busy && data.canSteer !== false) {
                 setThreadRunning(threadId, true);
                 setSending(true);
                 setRemoteBusy(true);
@@ -963,6 +966,21 @@ export function CodexRemoteConsole() {
             return false;
         } catch {
             return localBusy;
+        }
+    }
+
+    async function stopCurrentTurn() {
+        const threadId = activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId);
+        try {
+            await agentFetch<{ interrupted?: boolean }>("/agent/codex/turn/interrupt", {
+                method: "POST",
+                body: JSON.stringify(workspaceRequestBody(normalizeCanvasId(settingsRef.current.canvasId), { threadId })),
+            });
+            if (threadId) await refreshThreadMessages(threadId, normalizeCanvasId(settingsRef.current.canvasId), "", { forceScroll: true }).catch(() => undefined);
+            finishCurrentTurn("已停止当前任务", true);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            pushMessage({ id: createId(), role: "error", title: "停止失败", text: message });
         }
     }
 
@@ -1012,6 +1030,13 @@ export function CodexRemoteConsole() {
             pushMessage({ id: createId(), role: "status", text: "已引导对话" });
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
+            if (/no active.*turn|active.*turn.*steer|没有活动.*回合|没有.*turn/i.test(message)) {
+                clearPendingGuide(id);
+                await refreshThreadMessages(threadId, normalizeCanvasId(settingsRef.current.canvasId), "", { forceScroll: true }).catch(() => undefined);
+                finishCurrentTurn("当前任务已结束", true);
+                setTemporaryStatus("当前任务已结束，请作为新消息发送", true);
+                return;
+            }
             const fallbackMessage = isAgentRouteNotFound(message) ? "电脑 Agent 还没更新到支持 Codex 引导。重启新版 Agent 后再点“引导”。" : message;
             setTemporaryStatus("");
             pushMessage({ id: createId(), role: "error", title: "引导失败", text: fallbackMessage });
@@ -1127,6 +1152,29 @@ export function CodexRemoteConsole() {
             throw error;
         } finally {
             window.clearTimeout(timeout);
+        }
+    };
+
+    const restoreCodexDefaults = async () => {
+        if (resettingModelSettings) return;
+        updateSettings({ model: "", effort: "" });
+        if (!settingsRef.current.agentUrl.trim() || !settingsRef.current.token.trim()) {
+            setTemporaryStatus("已清空手机端模型设置；连接电脑后将使用默认模型。", true);
+            return;
+        }
+        setResettingModelSettings(true);
+        try {
+            const data = await agentFetch<{ workspace?: Workspace }>("/agent/codex/workspace", {
+                method: "POST",
+                body: JSON.stringify(workspaceRequestBody(normalizeCanvasId(settingsRef.current.canvasId), { model: "", effort: "" })),
+            });
+            if (data.workspace) setWorkspace(data.workspace);
+            setTemporaryStatus("已恢复电脑 Codex 默认模型", true);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            pushMessage({ id: createId(), role: "error", title: "恢复默认失败", text: `手机端已清空模型设置，但电脑 Bridge 尚未确认：${message}` });
+        } finally {
+            setResettingModelSettings(false);
         }
     };
 
@@ -1289,10 +1337,10 @@ export function CodexRemoteConsole() {
             try {
                 const query = workspaceSearchParams(canvasId);
                 query.set("threadId", threadId);
-                const status = await agentFetch<{ busy?: boolean }>(`/agent/codex/status?${query.toString()}`);
+                const status = await agentFetch<{ busy?: boolean; canSteer?: boolean; stale?: boolean }>(`/agent/codex/status?${query.toString()}`);
                 if (pollingRunKeyRef.current !== runKey || activeThreadIdRef.current !== threadId) return;
                 consecutiveFailures = 0;
-                if (!status.busy) {
+                if (!status.busy || status.canSteer === false || status.stale) {
                     await refreshThreadMessages(threadId, canvasId, prompt, { forceScroll: true }).catch(() => undefined);
                     if (pollingRunKeyRef.current !== runKey || activeThreadIdRef.current !== threadId) return;
                     finishCurrentTurn("本轮完成", true);
@@ -1320,13 +1368,45 @@ export function CodexRemoteConsole() {
         return Boolean(pendingPromptRef.current && visibleThreadId);
     };
 
+    const turnFailureKeys = (threadId = "", turnId = "") => [
+        turnId ? `turn:${turnId}` : "",
+        threadId ? `thread:${threadId}` : "",
+    ].filter(Boolean);
+
+    const reportCodexError = (rawMessage: string, threadId = "", turnId = "") => {
+        const message = rawMessage.trim() || "Codex 未返回具体错误原因";
+        const failureKeys = turnFailureKeys(threadId, turnId);
+        const existingKey = failureKeys.map((key) => failedTurnKeysRef.current.get(key)).find(Boolean) || "";
+        const failureKey = existingKey || failureKeys[0] || "";
+        const duplicate = Boolean(existingKey);
+        if (failureKey) {
+            failureKeys.forEach((key) => failedTurnKeysRef.current.set(key, failureKey));
+            if (failedTurnKeysRef.current.size > 200) {
+                const oldestKey = failedTurnKeysRef.current.keys().next().value;
+                if (oldestKey) failedTurnKeysRef.current.delete(oldestKey);
+            }
+        }
+        if (!duplicate) failCurrentTurn(message);
+
+        const recent = recentUnscopedErrorRef.current;
+        const now = Date.now();
+        const id = failureKey
+            ? `turn-error-${failureKey}`
+            : recent && recent.message === message && now - recent.at < 30_000
+              ? recent.id
+              : createId();
+        recentUnscopedErrorRef.current = { id, message, at: now };
+        upsertStreamMessage({ id, streamId: id, role: "error", title: "Codex", text: message });
+    };
+
     const handleAgentEvent = (event: AgentEvent) => {
         if (event.thread_id && event.type === "turn.started") setThreadRunning(event.thread_id, true);
-        if (event.thread_id && (event.type === "turn.completed" || event.type === "error")) setThreadRunning(event.thread_id, false);
+        if (event.thread_id && (event.type === "turn.completed" || (event.type === "error" && !event.will_retry))) setThreadRunning(event.thread_id, false);
         if (!eventBelongsToVisibleThread(event)) return;
         const item = event.item;
         const itemType = normalizeText(itemField(item, "type"));
         if (event.type === "turn.started") {
+            turnFailureKeys(event.thread_id, event.turn_id).forEach((key) => failedTurnKeysRef.current.delete(key));
             setSending(true);
             setRemoteBusy(true);
             setTemporaryStatus("Codex 正在思考...");
@@ -1335,14 +1415,19 @@ export function CodexRemoteConsole() {
             return;
         }
         if (event.type === "turn.completed") {
+            const failed = turnFailureKeys(event.thread_id, event.turn_id).some((key) => failedTurnKeysRef.current.has(key));
+            if (failed) return;
             finishCurrentTurn("本轮完成", true);
             upsertStreamMessage({ id: `done-${Date.now()}`, role: "status", text: "本轮完成" });
             return;
         }
         if (event.type === "error") {
-            const message = normalizeText(event.message || itemField(item, "message")) || "Codex 出错";
-            failCurrentTurn(message);
-            pushMessage({ id: createId(), role: "error", title: "Codex", text: message });
+            const message = normalizeText(event.message || itemField(item, "message")) || "Codex 未返回具体错误原因";
+            if (event.will_retry) {
+                setTemporaryStatus(`Codex 暂时出错，正在重试：${message}`);
+                return;
+            }
+            reportCodexError(message, event.thread_id, event.turn_id);
             return;
         }
         if ((event.type === "item.updated" || event.type === "item.completed") && itemType === "agent_message") {
@@ -1383,11 +1468,9 @@ export function CodexRemoteConsole() {
             if (data) handleAgentEvent(data);
         });
         source.addEventListener("agent_error", (event) => {
-            const data = parseEventData<{ message?: string; thread_id?: string }>(event);
+            const data = parseEventData<{ message?: string; thread_id?: string; turn_id?: string }>(event);
             if (!data?.thread_id || data.thread_id !== (activeThreadIdRef.current || normalizeThreadId(settingsRef.current.threadId))) return;
-            const message = data?.message || "Agent 出错";
-            failCurrentTurn(message);
-            pushMessage({ id: createId(), role: "error", title: "Agent", text: message });
+            reportCodexError(data.message || "Agent 未返回具体错误原因", data.thread_id, data.turn_id);
         });
         source.onerror = () => {
             setConnected(false);
@@ -1420,17 +1503,11 @@ export function CodexRemoteConsole() {
             const canvasId = normalizeCanvasId(settingsRef.current.canvasId);
             const threadId = normalizeThreadId(settingsRef.current.threadId) || activeThreadIdRef.current;
             const modelSettings = codexModelSettings(settingsRef.current);
-            let currentWorkspace: Workspace | null = null;
-            if (settingsRef.current.workspacePath.trim() || modelSettings.model || modelSettings.effort) {
-                const data = await agentFetch<{ workspace?: Workspace }>("/agent/codex/workspace", {
-                    method: "POST",
-                    body: JSON.stringify(workspaceRequestBody(canvasId, { ...(settingsRef.current.workspacePath.trim() ? { workspacePath: settingsRef.current.workspacePath.trim() } : {}), ...modelSettings })),
-                });
-                currentWorkspace = data.workspace || null;
-            } else {
-                const data = await agentFetch<{ workspace?: Workspace }>(`/agent/codex/workspace?${workspaceSearchParams(canvasId).toString()}`);
-                currentWorkspace = data.workspace || null;
-            }
+            const workspaceData = await agentFetch<{ workspace?: Workspace }>("/agent/codex/workspace", {
+                method: "POST",
+                body: JSON.stringify(workspaceRequestBody(canvasId, { ...(settingsRef.current.workspacePath.trim() ? { workspacePath: settingsRef.current.workspacePath.trim() } : {}), ...modelSettings })),
+            });
+            const currentWorkspace = workspaceData.workspace || null;
             const nextThreadId = threadId || currentWorkspace?.activeThreadId || "";
             const projectChoiceNeeded = !options.quiet && shouldChooseWorkspaceAfterConnect(settingsRef.current);
             const discoveredProjects = options.quiet ? projects : await refreshWorkspaceProjects(true);
@@ -1996,6 +2073,12 @@ export function CodexRemoteConsole() {
                                 <span className="truncate">{codexBusy || runStatus ? runStatus || (remoteBusy && !sending ? "当前会话运行中" : "Codex 后台执行中") : pendingGuides.length ? `${pendingGuides.length} 条待引导` : activeQueueCount ? `${activeQueueCount} 条任务排队中` : "任务队列"}</span>
                             </div>
                             <div className="flex shrink-0 items-center gap-2">
+                                {codexBusy || runStatus ? (
+                                    <button type="button" className="inline-flex items-center gap-1 text-xs font-medium text-red-600 transition hover:text-red-700 dark:text-red-300 dark:hover:text-red-200" onClick={() => void stopCurrentTurn()}>
+                                        <Square className="size-3.5 fill-current" />
+                                        停止
+                                    </button>
+                                ) : null}
                                 {queuedTasks.some((task) => task.status === "done" || task.status === "failed") ? (
                                     <button type="button" className="text-xs font-medium text-stone-500 transition hover:text-stone-950 dark:text-stone-400 dark:hover:text-stone-100" onClick={clearFinishedQueue}>
                                         清理
@@ -2460,7 +2543,7 @@ export function CodexRemoteConsole() {
                                         </div>
                                         <p className="mt-1 text-xs leading-5 text-stone-500 dark:text-stone-400">留空则沿用电脑 Codex 默认设置；填写后会传给本机 Codex app-server。</p>
                                         <div className="mt-3 grid grid-cols-2 gap-2">
-                                            <input value={settings.model} onChange={(event) => updateSettings({ model: event.target.value })} placeholder="模型，如 gpt-5.5" className="h-11 rounded-xl border border-black/10 bg-white/60 px-3 text-sm outline-none focus:border-stone-500 dark:border-white/10 dark:bg-white/[0.06]" />
+                                            <input value={settings.model} onChange={(event) => updateSettings({ model: event.target.value })} placeholder="模型 ID（可留空）" className="h-11 rounded-xl border border-black/10 bg-white/60 px-3 text-sm outline-none focus:border-stone-500 dark:border-white/10 dark:bg-white/[0.06]" />
                                             <select value={settings.effort} onChange={(event) => updateSettings({ effort: event.target.value })} className="h-11 rounded-xl border border-black/10 bg-white/60 px-3 text-sm outline-none focus:border-stone-500 dark:border-white/10 dark:bg-white/[0.06]">
                                                 <option value="">沿用默认强度</option>
                                                 <option value="low">low</option>
@@ -2469,6 +2552,10 @@ export function CodexRemoteConsole() {
                                                 <option value="xhigh">xhigh</option>
                                             </select>
                                         </div>
+                                        <button type="button" className="mt-2 inline-flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-black/10 bg-white/70 px-3 text-sm font-medium text-stone-700 transition hover:bg-white disabled:opacity-50 dark:border-white/10 dark:bg-white/[0.06] dark:text-stone-200 dark:hover:bg-white/10" onClick={() => void restoreCodexDefaults()} disabled={resettingModelSettings}>
+                                            {resettingModelSettings ? <LoaderCircle className="size-4 animate-spin" /> : <RotateCcw className="size-4" />}
+                                            使用电脑默认
+                                        </button>
                                     </div>
                                 </div>
                             </details>

@@ -20,6 +20,7 @@ import {
   listCodexThreads,
   readCodexThreadFast,
   beginCodexTurn,
+  interruptCodexTurn,
   startCodexThread,
   steerCodexTurn,
   summarizeCodexThread,
@@ -168,6 +169,14 @@ export function startHttpServer() {
     const requestId = String(req.get("idempotency-key") || req.body?.requestId || "");
     await steerCodexTurn(String(req.body?.prompt || ""), emit, attachments, { threadId, cwd: workspace.workspacePath, requestId });
     res.json({ ok: true, threadId });
+  }));
+  app.post("/agent/codex/turn/interrupt", route(async (req, res) => {
+    const workspace = ensureWorkspace(config, requestWorkspaceId(req));
+    const threadId = String(req.body?.threadId || workspace.activeThreadId || "");
+    if (!threadId) return res.json({ ok: true, interrupted: false, reason: "no_active_thread" });
+    const turnId = String(req.body?.turnId || "");
+    const result = await interruptCodexTurn(emit, threadId, workspace.workspacePath, turnId);
+    res.json({ ok: true, threadId, ...result });
   }));
   app.get("/agent/git/repos", (req, res) => {
     const workspace = ensureWorkspace(config, requestWorkspaceId(req));

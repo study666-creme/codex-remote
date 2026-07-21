@@ -29,6 +29,8 @@ type ThreadListResult = {
   backwardsCursor: unknown;
 };
 
+class ReportedCodexTurnError extends Error {}
+
 let codexApp: CodexAppClient | null = null;
 let codexAppStart: Promise<CodexAppClient> | null = null;
 let threadListGeneration = 0;
@@ -85,7 +87,9 @@ export async function beginCodexTurn(
     };
     invalidateThreadListCache();
     void completion
-      .catch((error) => emit("agent_error", { message: errorMessage(error) }, { threadId, turnId }))
+      .catch((error) => {
+        if (!(error instanceof ReportedCodexTurnError)) emit("agent_error", { message: errorMessage(error) }, { threadId, turnId });
+      })
       .finally(async () => {
         invalidateThreadListCache();
         await cleanupPreparedAttachments(prepared);
@@ -160,8 +164,17 @@ export async function getCodexThreadStatus(emit: AgentEmit, threadId: string, cw
   const localActiveTurnId = app.activeTurnId(threadId);
   const inferredActiveTurnId = localActiveTurnId ? "" : activeTurnIdFromThread(result);
   const activeTurnId = localActiveTurnId || inferredActiveTurnId || "";
-  const busy = Boolean(activeTurnId) || busyStatus(String(thread?.status || ""));
-  return { thread, busy, activeTurnId, canSteer: Boolean(activeTurnId) };
+  // A persisted thread can still report `running` after the app-server turn
+  // has ended. The active turn is the source of truth for mobile controls.
+  const busy = Boolean(activeTurnId);
+  return { thread, busy, activeTurnId, canSteer: Boolean(activeTurnId), stale: !activeTurnId && busyStatus(String(thread?.status || "")) };
+}
+
+export async function interruptCodexTurn(emit: AgentEmit, threadId: string, cwd?: string, turnId = "") {
+  const app = await getCodexApp(emit);
+  const activeTurnId = turnId || app.activeTurnId(threadId);
+  if (!activeTurnId) return { interrupted: false, reason: "no_active_turn" };
+  return app.interruptTurn(threadId, activeTurnId);
 }
 
 export async function startCodexThread(emit: AgentEmit, cwd?: string, options: CodexModelOptions = {}) {
@@ -233,7 +246,7 @@ export async function readCodexThread(emit: AgentEmit, threadId: string, cwd?: s
   return {
     thread: summary,
     messages: threadMessages(thread),
-    busy: Boolean(activeTurnId) || busyStatus(summary.status),
+    busy: Boolean(activeTurnId),
     activeTurnId,
   };
 }
@@ -298,6 +311,7 @@ class CodexAppClient {
   private threadByTurn = new Map<string, string>();
   private threadByItem = new Map<string, string>();
   private completedTurns = new Map<string, Error | null>();
+  private errorByTurn = new Map<string, string>();
 
   private constructor(private child: ChildProcess, private emit: AgentEmit) {}
 
@@ -409,6 +423,21 @@ class CodexAppClient {
     }
   }
 
+  async interruptTurn(threadId: string, turnId = "") {
+    const activeId = turnId || this.activeTurnByThread.get(threadId) || "";
+    if (!activeId) return { interrupted: false, reason: "no_active_turn" };
+    await this.request("turn/interrupt", { threadId, turnId: activeId });
+    if (this.activeTurnByThread.get(threadId) === activeId) this.activeTurnByThread.delete(threadId);
+    this.threadByTurn.delete(activeId);
+    const pending = this.activeTurns.get(activeId);
+    if (pending) {
+      this.activeTurns.delete(activeId);
+      if (pending.timer) clearTimeout(pending.timer);
+      pending.resolve({ interrupted: true });
+    }
+    return { interrupted: true, turnId: activeId };
+  }
+
   activeTurnId(threadId?: string) {
     if (threadId) return this.activeTurnByThread.get(threadId) || "";
     const value = this.activeTurnByThread.values().next().value;
@@ -478,24 +507,49 @@ class CodexAppClient {
     if (method === "thread/tokenUsage/updated") this.lastUsage = normalizeUsage(params);
     const event = normalizeCodexNotification(method, params);
     if (!event) return;
-    if (event.type === "turn.completed") event.usage = this.lastUsage;
-    this.emitForThread("agent_event", { agent: "codex", ...event }, context);
-    if (event.type !== "turn.completed") return;
+    const turnId = String(context.turnId || field(params, "turnId") || field(field(params, "turn"), "id") || "");
+    const isTurnCompletion = method === "turn/completed";
 
-    const turnId = String(field(params, "turnId") || field(field(params, "turn"), "id") || "");
-    const threadId = String(field(params, "threadId") || field(field(params, "turn"), "threadId") || "");
+    if (!isTurnCompletion) {
+      if (event.type === "error" && turnId && event.will_retry !== true) {
+        const previous = this.errorByTurn.get(turnId) || "";
+        const message = moreDetailedError(previous, String(event.message || ""));
+        if (message === previous) return;
+        this.errorByTurn.set(turnId, message);
+        event.message = message;
+      }
+      this.emitForThread("agent_event", { agent: "codex", ...event }, context);
+      return;
+    }
+
+    const previousError = turnId ? this.errorByTurn.get(turnId) || "" : "";
+    const completionError = event.type === "error" ? String(event.message || "") : "";
+    const failureMessage = moreDetailedError(previousError, completionError);
+    if (failureMessage) {
+      event.type = "error";
+      event.message = failureMessage;
+    } else {
+      event.type = "turn.completed";
+      event.usage = this.lastUsage;
+    }
+    if (!previousError || failureMessage !== previousError) {
+      this.emitForThread("agent_event", { agent: "codex", ...event }, context);
+    }
+
+    const threadId = String(context.threadId || field(params, "threadId") || field(field(params, "turn"), "threadId") || "");
     if (threadId && this.activeTurnByThread.get(threadId) === turnId) this.activeTurnByThread.delete(threadId);
     const pending = this.activeTurns.get(turnId);
-    const error = field(field(params, "turn"), "error");
+    const error = failureMessage ? new ReportedCodexTurnError(failureMessage) : null;
     if (pending) {
       this.activeTurns.delete(turnId);
-      error ? pending.reject(new Error(String(field(error, "message") || "Codex turn failed"))) : pending.resolve(event);
+      error ? pending.reject(error) : pending.resolve(event);
     } else if (turnId) {
-      this.completedTurns.set(turnId, error ? new Error(String(field(error, "message") || "Codex turn failed")) : null);
+      this.completedTurns.set(turnId, error);
     }
+    if (turnId) this.errorByTurn.delete(turnId);
     this.emitForThread("agent_event", { agent: "codex", type: "stream.summary", delta_count: this.deltaCount }, context);
     this.deltaCount = 0;
-    this.emitForThread("agent_done", { agent: "codex", usage: event.usage }, context);
+    this.emitForThread("agent_done", { agent: "codex", usage: event.usage, ...(failureMessage ? { error: failureMessage } : {}) }, context);
   }
 
   private emitDelta(params: Json, context: { threadId?: string; turnId?: string }) {
@@ -556,6 +610,7 @@ class CodexAppClient {
     this.activeTurnByThread.clear();
     this.threadByTurn.clear();
     this.threadByItem.clear();
+    this.errorByTurn.clear();
   }
 }
 
@@ -592,14 +647,55 @@ function codexInput(prompt: string, images: string[], documents: DocumentMention
   ];
 }
 
-function normalizeCodexNotification(method: string, params: Json): AgentEvent | null {
+export function normalizeCodexNotification(method: string, params: Json): AgentEvent | null {
   if (method === "thread/started") return { type: "thread.started", thread_id: field(field(params, "thread"), "id") };
   if (method === "turn/started") return { type: "turn.started", thread_id: field(params, "threadId"), turn_id: field(field(params, "turn"), "id") };
-  if (method === "turn/completed") return { type: "turn.completed", usage: null };
+  if (method === "turn/completed") {
+    const message = codexNotificationErrorMessage(params);
+    return message ? { type: "error", message } : { type: "turn.completed", usage: null };
+  }
   if (method === "item/started") return { type: "item.started", item: normalizeItem(field(params, "item")) };
   if (method === "item/completed") return { type: "item.completed", item: normalizeItem(field(params, "item")) };
-  if (method === "error") return { type: "error", message: field(params, "message") };
+  if (method === "error") {
+    return {
+      type: "error",
+      message: codexNotificationErrorMessage(params) || "Codex request failed",
+      will_retry: field(params, "willRetry") === true,
+    };
+  }
   return null;
+}
+
+export function codexNotificationErrorMessage(value: unknown) {
+  const turn = field(value, "turn");
+  const candidates = [
+    errorDetail(field(turn, "error")),
+    errorDetail(field(value, "error")),
+    errorDetail(field(turn, "message")),
+    errorDetail(field(value, "message")),
+  ].filter(Boolean);
+  const status = String(field(turn, "status") || field(value, "status") || "").toLowerCase();
+  if (!candidates.length && ["failed", "error"].includes(status)) candidates.push(`Codex turn failed (${status})`);
+  return candidates.reduce((best, current) => moreDetailedError(best, current), "");
+}
+
+function errorDetail(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (value instanceof Error) return value.message.trim();
+  const message = field(value, "message");
+  if (typeof message === "string" && message.trim()) return message.trim();
+  if (!value || typeof value !== "object") return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
+
+function moreDetailedError(left: string, right: string) {
+  const first = left.trim();
+  const second = right.trim();
+  return second.length > first.length ? second : first;
 }
 
 async function findSessionFile(threadId: string) {
